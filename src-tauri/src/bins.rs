@@ -1,9 +1,11 @@
 //! 外部二进制查找与进程拉起工具。
 //!
-//! Windows 上 mpv/ffmpeg 是绿色软件（解压即用），查找顺序：
+//! 查找顺序：
 //! 1. 设置页指定目录（用户显式配置，最高优先级）
 //! 2. PATH（用户自行安装）
-//! 3. 应用所在目录（随包携带：sidecar / resources 释放）
+//! 3. 应用 resources 目录（随包携带）：
+//!    - Windows/Linux：exe 同目录的 `<name>` 或 `<name>/<name>` 子目录（mpv 是 exe+dll 文件夹）
+//!    - macOS .app：Contents/Resources/ 下同名文件或同名子目录
 //! 都找不到时返回裸名字，让 spawn 错误信息自然暴露。
 
 use std::path::{Path, PathBuf};
@@ -24,11 +26,23 @@ pub fn resolve(name: &str, configured_dir: Option<&Path>) -> PathBuf {
     if in_path(&file_name) {
         return PathBuf::from(&file_name);
     }
+    // 3. 应用 resources 目录
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join(&file_name);
-            if p.is_file() {
-                return p;
+            // Windows/Linux：exe 同目录；同名子目录（mpv 文件夹：mpv/mpv.exe + dll）
+            for p in [dir.join(&file_name), dir.join(name).join(&file_name)] {
+                if p.is_file() {
+                    return p;
+                }
+            }
+            // macOS .app：exe 在 Contents/MacOS/，resources 在 Contents/Resources/
+            #[cfg(target_os = "macos")]
+            if let Some(res) = dir.parent().map(|c| c.join("Resources")) {
+                for p in [res.join(&file_name), res.join(name).join(&file_name)] {
+                    if p.is_file() {
+                        return p;
+                    }
+                }
             }
         }
     }
@@ -72,6 +86,24 @@ mod tests {
         let got = resolve("mpv", Some(&dir));
         assert_eq!(got, fake);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finds_binary_in_sibling_subdir() {
+        // mpv 布局：<exe_dir>/mpv/mpv(.exe)。借 test harness 的 exe 目录模拟
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap().to_path_buf();
+        #[cfg(windows)]
+        let name = "loopsub-fake-bin.exe";
+        #[cfg(not(windows))]
+        let name = "loopsub-fake-bin";
+        let sub = dir.join("loopsub-fake-bin");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(name), b"x").unwrap();
+
+        let got = resolve("loopsub-fake-bin", None);
+        assert_eq!(got, sub.join(name));
+        std::fs::remove_dir_all(&sub).ok();
     }
 
     #[test]

@@ -44,6 +44,42 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # ---- 随包携带外部程序（下载到 src-tauri/resources/，bundle.resources 释放） ----
+      # Windows：mpv（sourceforge RSS 动态发现最新版，exe+dll 文件夹）+ ffmpeg/ffprobe（gyan.dev 静态单 exe）
+      - name: Bundle mpv & ffmpeg (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force src-tauri\resources | Out-Null
+          # ffmpeg + ffprobe
+          Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          7z x ffmpeg.zip
+          Copy-Item "ffmpeg-*-essentials_build\bin\ffmpeg.exe" src-tauri\resources\
+          Copy-Item "ffmpeg-*-essentials_build\bin\ffprobe.exe" src-tauri\resources\
+          # mpv：RSS 按时间倒序，第一条即最新
+          $rss = (Invoke-WebRequest "https://sourceforge.net/projects/mpv-player-windows/rss?path=/64bit").Content
+          $name = [regex]::Match($rss, 'mpv-x86_64-\d+-git-[0-9a-f]+\.7z').Value
+          if (-not $name) { throw "未能从 sourceforge RSS 解析 mpv 最新版本" }
+          Write-Host "mpv: $name"
+          Invoke-WebRequest "https://sourceforge.net/projects/mpv-player-windows/files/64bit/$name/download" -OutFile mpv.7z
+          7z x mpv.7z -ompv_pkg
+          $inner = Get-ChildItem mpv_pkg
+          $src = if ($inner.Count -eq 1 -and $inner[0].PSIsContainer) { $inner[0].FullName } else { 'mpv_pkg' }
+          New-Item -ItemType Directory -Force src-tauri\resources\mpv | Out-Null
+          Copy-Item "$src\*" src-tauri\resources\mpv -Recurse
+
+      # macOS：ffmpeg/ffprobe（evermeet 静态构建，x86_64；ARM Mac 经 Rosetta 2 运行）。
+      # mpv 无可靠 macOS 静态构建源，仍需用户 brew install mpv。
+      - name: Bundle ffmpeg (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          mkdir -p src-tauri/resources
+          curl -fL -o ffmpeg.zip "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip"
+          unzip -o ffmpeg.zip -d src-tauri/resources/
+          curl -fL -o ffprobe.zip "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip"
+          unzip -o ffprobe.zip -d src-tauri/resources/
+          chmod +x src-tauri/resources/ffmpeg src-tauri/resources/ffprobe
+
       # 纯静态前端（src/*.html|js|css + withGlobalTauri），无 node 构建步骤；
       # tauri-action 检测到无 package.json 时自动使用 cargo tauri build。
       - name: Build & upload release
@@ -55,18 +91,15 @@ jobs:
           releaseName: "loopSub ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
           releaseBody: |
             ## 安装
-            - **Windows**：`.msi` 或 `-setup.exe`（NSIS，当前用户安装，无需管理员）
-            - **macOS**：`.dmg`（Apple Silicon 用 aarch64，Intel 用 x64）
+            - **Windows**：`.msi` 或 `-setup.exe`（NSIS，当前用户安装，无需管理员），已内置 mpv 与 ffmpeg，开箱即用
+            - **macOS**：`.dmg`（Apple Silicon 用 aarch64，Intel 用 x64），已内置 ffmpeg；**mpv 需自行安装**：`brew install mpv`
 
-            ## 外部依赖（不随包携带，二选一）
-            1. 自行安装 [mpv](https://mpv.io/installation/) 与 [ffmpeg](https://ffmpeg.org/download.html) 并加入 PATH
-            2. 或在 loopSub 设置页「外部程序」中指定二者所在目录
+            ## 外部依赖
+            未随包携带的程序可在 loopSub 设置页「外部程序」中指定所在目录，或加入 PATH。
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
 
-# TODO（后续迭代）：Windows 包随包携带外部程序
-#   - ffmpeg/ffprobe：单 exe 静态编译，下载 https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
-#     解压 bin/*.exe 进 resources，tauri.conf.json bundle.resources 配置后即可
-#   - mpv：Windows 版是 mpv.exe + mpv-2.dll 文件夹（sourceforge shinchiro 构建，URL 带版本日期需固定），
-#     整个文件夹进 resources；macOS 建议继续依赖 brew 安装（dylib 依赖链不适合携带）
+# TODO（后续迭代）：macOS 的 mpv 随包携带
+#   无可靠静态构建源（stolendata 已不可用）；可选方案：CI 里 brew install mpv 后
+#   用 dylibbundler 收集依赖 dylib 一并打进 .app，或引导用户 brew install mpv（现状）。
