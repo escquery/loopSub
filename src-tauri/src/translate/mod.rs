@@ -1,6 +1,12 @@
-//! LLM 翻译管线——分块器（gpt-subtrans 两级策略的移植）：
-//! 场景按时间间隙切（默认 60s），场景内超大批在最大间隙处递归二分（10~30 行）。
-//! LLM 客户端、摘要链、术语表在 v1.5 实现。
+//! LLM 翻译管线（gpt-subtrans 策略的移植）：
+//! 分块（两级：60s 间隙切场景 + 最大间隙递归二分 10~30 行）、摘要链上下文、
+//! 术语表防伪、错误明细重试（升温）。autosplit 默认不做——与 gpt-subtrans 默认一致。
+
+pub mod llm;
+pub mod parser;
+pub mod prompt;
+
+use std::collections::{BTreeMap, HashMap};
 
 use crate::subtitle::SubtitleLine;
 
@@ -79,6 +85,141 @@ fn split_at_largest_gaps(lines: &[SubtitleLine], min_batch: usize, max_batch: us
     left
 }
 
+// ---------- 编排器 ----------
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TranslateProgress {
+    pub done_batches: usize,
+    pub total_batches: usize,
+    pub failed_lines: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct TranslateOutcome {
+    /// number -> 译文；失败的行填占位文本，保证编号完整
+    pub translations: BTreeMap<u32, String>,
+    pub failed: Vec<u32>,
+}
+
+/// 整集翻译：串行逐批（串行对一集 20~30 批的规模已够；并发后续再加）
+pub async fn translate_all<C: llm::Chat>(
+    client: &C,
+    lines: &[SubtitleLine],
+    scene_threshold_ms: i64,
+    min_batch: usize,
+    max_batch: usize,
+    mut on_progress: impl FnMut(TranslateProgress),
+) -> TranslateOutcome {
+    let batches = build_batches(lines, scene_threshold_ms, min_batch, max_batch);
+    let total_batches = batches.len();
+    let mut out = TranslateOutcome::default();
+    let mut history: Vec<String> = Vec::new(); // 摘要链（最多 10 条）
+    let mut terminology: HashMap<String, String> = HashMap::new();
+
+    for (i, batch) in batches.iter().enumerate() {
+        on_progress(TranslateProgress {
+            done_batches: i,
+            total_batches,
+            failed_lines: out.failed.len(),
+        });
+
+        let expected: Vec<u32> = batch.lines.iter().map(|l| l.number).collect();
+        let originals = batch
+            .lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let (parsed, errors) = translate_batch(client, batch, &history, &terminology, &expected).await;
+
+        if errors.is_empty() {
+            // 术语防伪后并入表（已有条目不覆盖，先到先得）
+            let translated_text = parsed
+                .translations
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            for (en, zh) in parser::sanitize_terminology(&parsed, &originals, &translated_text) {
+                terminology.entry(en).or_insert(zh);
+            }
+            if let Some(s) = parsed.summary {
+                history.push(s);
+                if history.len() > 10 {
+                    history.remove(0);
+                }
+            }
+        }
+
+        // 已翻的行入库（部分成功也算），缺失的行占位并记入 failed
+        for n in &expected {
+            match parsed.translations.get(n) {
+                Some(t) if !t.trim().is_empty() => {
+                    out.translations.insert(*n, t.clone());
+                }
+                _ => {
+                    out.translations
+                        .insert(*n, "[翻译失败，可重试]".to_string());
+                    out.failed.push(*n);
+                }
+            }
+        }
+    }
+
+    on_progress(TranslateProgress {
+        done_batches: total_batches,
+        total_batches,
+        failed_lines: out.failed.len(),
+    });
+    out
+}
+
+/// 单批翻译：首次 → 带错误明细重试（升温 0.1）。返回（解析结果，最终错误列表）
+async fn translate_batch<C: llm::Chat>(
+    client: &C,
+    batch: &Batch,
+    history: &[String],
+    terminology: &HashMap<String, String>,
+    expected: &[u32],
+) -> (parser::ParsedBatch, Vec<String>) {
+    let mut last = match client
+        .chat(
+            prompt::SYSTEM_PROMPT,
+            &prompt::build_user_prompt(&batch.lines, history, terminology, None),
+            0.3,
+        )
+        .await
+    {
+        Ok(resp) => {
+            let parsed = parser::parse_response(&resp);
+            let errors = parser::validate(&parsed, expected);
+            if errors.is_empty() {
+                return (parsed, errors);
+            }
+            (parsed, errors)
+        }
+        Err(e) => (
+            parser::ParsedBatch::default(),
+            vec![format!("api error: {e}")],
+        ),
+    };
+
+    // 重试一次：附上错误明细，温度 +0.1
+    let retry_user = prompt::build_user_prompt(&batch.lines, history, terminology, Some(&last.1));
+    if let Ok(resp) = client.chat(prompt::SYSTEM_PROMPT, &retry_user, 0.4).await {
+        let parsed = parser::parse_response(&resp);
+        let errors = parser::validate(&parsed, expected);
+        // 合并两次结果：重试优先，首次补齐
+        let mut merged = parsed;
+        for (n, t) in last.0.translations {
+            merged.translations.entry(n).or_insert(t);
+        }
+        last = (merged, errors);
+    }
+    last
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +267,85 @@ mod tests {
         assert!(batches.iter().all(|b| b.lines.len() >= 10 && b.lines.len() <= 20));
         // 应该在第 12/13 句之间断开
         assert_eq!(batches[0].lines.len(), 12);
+    }
+
+    // ---------- 编排器（mock LLM） ----------
+
+    struct MockLlm {
+        responses: Vec<String>,
+        calls: std::sync::atomic::AtomicUsize,
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MockLlm {
+        fn new(responses: Vec<&str>) -> Self {
+            Self {
+                responses: responses.into_iter().map(String::from).collect(),
+                calls: Default::default(),
+                prompts: Default::default(),
+            }
+        }
+    }
+
+    impl llm::Chat for MockLlm {
+        async fn chat(
+            &self,
+            _system: &str,
+            user: &str,
+            _temperature: f32,
+        ) -> Result<String, llm::LlmError> {
+            let i = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.prompts.lock().unwrap().push(user.to_string());
+            self.responses
+                .get(i)
+                .cloned()
+                .ok_or_else(|| llm::LlmError::Api("no more responses".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_retries_and_chains_context() {
+        // 两场景各 2 句（间隔 70s > 阈值 60s）
+        let mut lines = dialogue(2, 0);
+        lines.extend(dialogue(2, 70_000));
+        for (i, l) in lines.iter_mut().enumerate() {
+            l.number = (i + 1) as u32;
+        }
+
+        let mock = MockLlm::new(vec![
+            // 批1首次：缺 #2，触发重试
+            "#1\nOriginal>\nline 1\nTranslation>\n第一句\n",
+            // 批1重试：完整 + 摘要 + 术语
+            "#1\nOriginal>\nline 1\nTranslation>\n第一句\n\n#2\nOriginal>\nline 2\nTranslation>\n第二句\n\n<summary>Two opening lines.</summary>\n<terminology>\n</terminology>",
+            // 批2首次即完整
+            "#3\nOriginal>\nline 3\nTranslation>\n第三句\n\n#4\nOriginal>\nline 4\nTranslation>\n第四句\n",
+        ]);
+
+        let mut progress = Vec::new();
+        let out = translate_all(&mock, &lines, 60_000, 10, 30, |p| progress.push(p)).await;
+
+        assert!(out.failed.is_empty(), "所有行都应翻译成功: {:?}", out.failed);
+        assert_eq!(out.translations.len(), 4);
+        assert_eq!(out.translations[&2], "第二句");
+
+        let prompts = mock.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 3, "批1首次+重试，批2一次");
+        // 重试 prompt 带错误明细
+        assert!(prompts[1].contains("missing translation for line #2"));
+        // 批2 prompt 带批1的摘要（上下文链生效）
+        assert!(prompts[2].contains("Two opening lines."));
+        // 进度回调：首帧 total=2，末帧 done=2
+        assert_eq!(progress.first().unwrap().total_batches, 2);
+        assert_eq!(progress.last().unwrap().done_batches, 2);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_fills_placeholder_on_failure() {
+        let lines = dialogue(2, 0);
+        let mock = MockLlm::new(vec!["garbage without lines", "still garbage"]);
+        let out = translate_all(&mock, &lines, 60_000, 10, 30, |_| {}).await;
+        assert_eq!(out.failed.len(), 2);
+        assert!(out.translations[&1].contains("翻译失败"));
+        assert!(out.translations[&2].contains("翻译失败"));
     }
 }

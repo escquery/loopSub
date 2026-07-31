@@ -7,21 +7,42 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div id="video-bar">
+  <div id="top-bar">
     <input id="video-path" placeholder="视频文件路径（自动提取内嵌字幕并播放）" />
     <button id="btn-play">加载视频</button>
+    <button id="btn-open-search" title="搜索字幕">🔍</button>
+    <button id="btn-settings" title="设置">⚙</button>
   </div>
 
-  <header id="conn-bar">
-    <input id="socket-path" placeholder="高级：连接已运行的 mpv socket" />
-    <button id="btn-connect">连接</button>
-    <span id="conn-status">未连接</span>
-  </header>
+  <div id="notice-bar" class="hidden"></div>
 
-  <div id="load-bar">
-    <input id="srt-path" placeholder="手动加载字幕文件（.srt，测试用）" />
-    <button id="btn-load">加载字幕</button>
+  <div id="search-panel" class="hidden">
+    <div class="panel-head">
+      <span class="panel-title">OpenSubtitles 搜索</span>
+      <button id="btn-search">搜索</button>
+      <button id="btn-search-close" title="关闭">×</button>
+    </div>
+    <div id="search-results"><span class="dim">尚未搜索</span></div>
   </div>
+
+  <div id="trans-bar" class="hidden">
+    <button id="btn-translate">翻译整集</button>
+    <span id="trans-progress" class="dim"></span>
+    <button id="btn-toggle-zh" class="hidden">隐藏译文</button>
+  </div>
+
+  <details id="advanced">
+    <summary>高级</summary>
+    <div id="conn-bar">
+      <input id="socket-path" placeholder="连接已运行的 mpv socket" />
+      <button id="btn-connect">连接</button>
+      <span id="conn-status">未连接</span>
+    </div>
+    <div id="load-bar">
+      <input id="srt-path" placeholder="手动加载字幕文件（.srt）" />
+      <button id="btn-load">加载字幕</button>
+    </div>
+  </details>
 
   <div id="status-badges"></div>
 
@@ -39,6 +60,19 @@
     </div>
   </footer>
 
+  <div id="settings-drawer" class="hidden">
+    <div class="drawer-head">
+      <span class="panel-title">设置</span>
+      <button id="btn-settings-close" title="关闭">×</button>
+    </div>
+    <div id="settings-body"></div>
+    <div class="drawer-foot">
+      <button id="btn-settings-save">保存</button>
+      <span id="settings-msg" class="dim"></span>
+    </div>
+  </div>
+
+  <script src="settings.js"></script>
   <script src="main.js"></script>
 </body>
 </html>
