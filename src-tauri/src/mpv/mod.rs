@@ -153,11 +153,12 @@ pub fn default_ipc_endpoint() -> String {
 }
 
 /// 以“纯显示器”模式拉起 mpv（缴械参数见 DESIGN.md §2）
-pub fn spawn_mpv(endpoint: &str) -> std::io::Result<std::process::Child> {
+/// bin：由 crate::bins::resolve 解析出的 mpv 路径
+pub fn spawn_mpv(endpoint: &str, bin: &std::path::Path) -> std::io::Result<std::process::Child> {
     #[cfg(unix)]
     let _ = std::fs::remove_file(endpoint); // 清理残留 socket
 
-    let mut cmd = std::process::Command::new("mpv");
+    let mut cmd = std::process::Command::new(bin);
     cmd.args([
         "--idle=yes",
         "--force-window",
@@ -171,11 +172,7 @@ pub fn spawn_mpv(endpoint: &str) -> std::io::Result<std::process::Child> {
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::null());
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
+    crate::bins::no_window(&mut cmd);
 
     cmd.spawn()
 }

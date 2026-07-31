@@ -8,6 +8,7 @@ pub mod opensub;
 pub mod settings;
 pub mod subtitle;
 pub mod translate;
+mod bins;
 mod winctl;
 
 use std::path::PathBuf;
@@ -93,6 +94,12 @@ impl AppState {
             .replace(['/', '\\', ':'], "_")
     }
 
+    /// 解析外部二进制（设置目录 → PATH → 应用目录）
+    fn bin(&self, name: &str) -> PathBuf {
+        let dir = self.settings.lock().unwrap().bins.dir.clone();
+        bins::resolve(name, dir.as_deref())
+    }
+
     fn llm_tuning(&self) -> (i64, usize, usize) {
         let llm = &self.settings.lock().unwrap().llm;
         (
@@ -140,7 +147,8 @@ async fn mpv_start_internal(state: &AppState) -> Result<(), String> {
         return Ok(());
     }
     let endpoint = mpv::default_ipc_endpoint();
-    let child = mpv::spawn_mpv(&endpoint).map_err(|e| format!("启动 mpv 失败（未安装？）: {e}"))?;
+    let mpv_bin = state.bin("mpv");
+    let child = mpv::spawn_mpv(&endpoint, &mpv_bin).map_err(|e| format!("启动 mpv 失败（未安装？可在设置页指定目录）: {e}"))?;
     let ipc = mpv::connect_with_retry(&endpoint, 30)
         .await
         .map_err(|e| format!("连接 mpv IPC 失败: {e}"))?;
@@ -223,11 +231,13 @@ async fn load_video(state: tauri::State<'_, AppState>, path: String) -> Result<m
     } else {
         let v = video.clone();
         let out = original.clone();
+        let ffprobe = state.bin("ffprobe");
+        let ffmpeg = state.bin("ffmpeg");
         let extracted = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let tracks = media::probe_subtitles(&v).map_err(|e| e.to_string())?;
+            let tracks = media::probe_subtitles(&v, &ffprobe).map_err(|e| e.to_string())?;
             match media::pick_text_track(&tracks) {
                 Some(track) => {
-                    media::extract_subtitle(&v, track.index, &out).map_err(|e| e.to_string())?;
+                    media::extract_subtitle(&v, track.index, &out, &ffmpeg).map_err(|e| e.to_string())?;
                     Ok(true)
                 }
                 None => Ok(false),

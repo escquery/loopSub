@@ -44,19 +44,20 @@ pub struct LoadVideoResult {
     pub notice: Option<String>,
 }
 
-pub fn probe_subtitles(video: &Path) -> Result<Vec<SubTrack>, MediaError> {
-    let output = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_streams",
-            "-select_streams",
-            "s",
-        ])
-        .arg(video)
-        .output()?;
+pub fn probe_subtitles(video: &Path, ffprobe: &Path) -> Result<Vec<SubTrack>, MediaError> {
+    let mut cmd = std::process::Command::new(ffprobe);
+    cmd.args([
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_streams",
+        "-select_streams",
+        "s",
+    ])
+    .arg(video);
+    crate::bins::no_window(&mut cmd);
+    let output = cmd.output()?;
     if !output.status.success() {
         return Err(MediaError::Ffprobe(
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -104,13 +105,14 @@ pub fn pick_text_track(tracks: &[SubTrack]) -> Option<&SubTrack> {
         .or_else(|| tracks.iter().find(|t| t.is_text))
 }
 
-pub fn extract_subtitle(video: &Path, track_index: u32, out: &Path) -> Result<(), MediaError> {
-    let output = std::process::Command::new("ffmpeg")
-        .args(["-y", "-v", "error", "-i"])
+pub fn extract_subtitle(video: &Path, track_index: u32, out: &Path, ffmpeg: &Path) -> Result<(), MediaError> {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-y", "-v", "error", "-i"])
         .arg(video)
         .args(["-map", &format!("0:{track_index}"), "-c:s", "srt"])
-        .arg(out)
-        .output()?;
+        .arg(out);
+    crate::bins::no_window(&mut cmd);
+    let output = cmd.output()?;
     if !output.status.success() {
         return Err(MediaError::Ffmpeg(
             String::from_utf8_lossy(&output.stderr).into_owned(),

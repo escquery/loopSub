@@ -110,6 +110,10 @@ const SettingsUI = {
         <label>缓存目录（留空用系统默认）<input data-k="cache.dir" value="${esc(s.cache.dir)}" /></label>
       </section>
       <section>
+        <h3>外部程序</h3>
+        <label>mpv / ffmpeg 所在目录（留空按 PATH → 应用目录查找）<input data-k="bins.dir" value="${esc(s.bins.dir)}" /></label>
+      </section>
+      <section>
         <h3>窗口</h3>
         <label class="row"><input type="checkbox" data-k="window.mini_bar" ${s.window.mini_bar ? 'checked' : ''} /> 播放时自动收起为迷你条</label>
         <label class="row"><input type="checkbox" data-k="window.sink_on_blur" ${s.window.sink_on_blur ? 'checked' : ''} /> 切走时取消置顶（沉底）</label>

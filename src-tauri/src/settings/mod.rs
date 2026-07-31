@@ -15,6 +15,7 @@ pub struct Settings {
     pub opensubtitles: OpenSubtitlesSettings,
     pub llm: LlmSettings,
     pub cache: CacheSettings,
+    pub bins: BinSettings,
     pub window: WindowSettings,
 }
 
@@ -87,6 +88,13 @@ pub struct CacheSettings {
     pub dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BinSettings {
+    /// mpv / ffmpeg / ffprobe 所在目录；None 按 PATH → 应用目录查找
+    pub dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowSettings {
@@ -119,6 +127,7 @@ impl Default for Settings {
             opensubtitles: OpenSubtitlesSettings::default(),
             llm: LlmSettings::default(),
             cache: CacheSettings::default(),
+            bins: BinSettings::default(),
             window: WindowSettings::default(),
         }
     }
