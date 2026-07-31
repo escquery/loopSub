@@ -25,7 +25,23 @@
     }
   },
   "bundle": {
-    "active": false,
-    "icon": []
+    "active": true,
+    "targets": "all",
+    "category": "Video",
+    "shortDescription": "Subtitle-driven language learning for mpv",
+    "longDescription": "loopSub turns subtitles into a playback controller for TV-show language learning: sentence navigation, A-B loops, shadowing pauses, subtitle search and LLM translation, all by remote-controlling mpv.",
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
   }
 }

@@ -1,0 +1,72 @@
+name: Release
+
+# 触发方式：
+#   1. 推送版本 tag：git tag v0.1.0 && git push origin v0.1.0
+#   2. Actions 页面手动 Run workflow（需填 tag）
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag（如 v0.1.0）'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write # 创建 GitHub Release 并上传安装包
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-13 # Intel Mac
+            target: x86_64-apple-darwin
+          - os: macos-latest # Apple Silicon
+            target: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 纯静态前端（src/*.html|js|css + withGlobalTauri），无 node 构建步骤；
+      # tauri-action 检测到无 package.json 时自动使用 cargo tauri build。
+      - name: Build & upload release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: "${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          releaseName: "loopSub ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          releaseBody: |
+            ## 安装
+            - **Windows**：`.msi` 或 `-setup.exe`（NSIS，当前用户安装，无需管理员）
+            - **macOS**：`.dmg`（Apple Silicon 用 aarch64，Intel 用 x64）
+
+            ## 外部依赖（不随包携带，二选一）
+            1. 自行安装 [mpv](https://mpv.io/installation/) 与 [ffmpeg](https://ffmpeg.org/download.html) 并加入 PATH
+            2. 或在 loopSub 设置页「外部程序」中指定二者所在目录
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }}
+
+# TODO（后续迭代）：Windows 包随包携带外部程序
+#   - ffmpeg/ffprobe：单 exe 静态编译，下载 https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+#     解压 bin/*.exe 进 resources，tauri.conf.json bundle.resources 配置后即可
+#   - mpv：Windows 版是 mpv.exe + mpv-2.dll 文件夹（sourceforge shinchiro 构建，URL 带版本日期需固定），
+#     整个文件夹进 resources；macOS 建议继续依赖 brew 安装（dylib 依赖链不适合携带）
