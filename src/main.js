@@ -12,7 +12,10 @@ const state = {
   selected: new Set(),
   lastClickIdx: -1,
   sentenceLoop: false,
+  followMode: false,
+  followPausedIdx: -1,  // 跟读模式已在哪一句暂停过（防止重复暂停）
   copyTemplate: '请逐句讲解以下美剧台词中的生词、短语和口语用法：\n\n{lines}',
+  delayStep: 0.1,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -32,20 +35,48 @@ async function mpv(...args) {
 
 const osd = (text) => mpv('show-text', text, 1200);
 
-// ---------- 连接与字幕加载 ----------
+function markConnected() {
+  state.connected = true;
+  $('#conn-status').textContent = '已连接';
+  $('#conn-status').classList.add('ok');
+}
+
+// ---------- 视频 / 字幕加载 ----------
+$('#btn-play').addEventListener('click', async () => {
+  const path = $('#video-path').value.trim();
+  if (!path) return;
+  const btn = $('#btn-play');
+  btn.disabled = true;
+  btn.textContent = '加载中…';
+  try {
+    const res = await invoke('load_video', { path });
+    state.lines = res.lines;
+    state.currentIdx = -1;
+    state.selected.clear();
+    markConnected();
+    renderList();
+    osd(`字幕来源：${res.source === 'cache' ? '缓存' : '内嵌提取'}`);
+  } catch (e) {
+    alert('加载视频失败: ' + e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '加载视频';
+  }
+});
+
+// 手动连接已运行的 mpv（高级）
 $('#btn-connect').addEventListener('click', async () => {
   const socketPath = $('#socket-path').value.trim();
   if (!socketPath) return;
   try {
     await invoke('mpv_connect', { socketPath });
-    state.connected = true;
-    $('#conn-status').textContent = '已连接';
-    $('#conn-status').classList.add('ok');
+    markConnected();
   } catch (e) {
     $('#conn-status').textContent = '连接失败: ' + e;
   }
 });
 
+// 手动加载 SRT（测试用）
 $('#btn-load').addEventListener('click', async () => {
   const path = $('#srt-path').value.trim();
   if (!path) return;
@@ -111,6 +142,7 @@ function syncSelectionUI() {
 function seekToLine(idx) {
   const l = state.lines[idx];
   if (!l) return;
+  state.followPausedIdx = -1; // 用户主动跳转，跟读重新武装
   mpv('seek', l.start_ms / 1000, 'absolute');
   mpv('set_property', 'pause', false);
 }
@@ -142,21 +174,56 @@ function setCurrent(idx) {
 setInterval(async () => {
   if (!state.connected || state.lines.length === 0) return;
   const pos = await mpv('get_property', 'time-pos');
-  if (typeof pos === 'number') setCurrent(findCurrent(pos * 1000));
+  if (typeof pos === 'number') {
+    setCurrent(findCurrent(pos * 1000));
+    // 跟读模式：越过当前句结尾自动暂停一次
+    if (state.followMode && state.currentIdx >= 0) {
+      const line = state.lines[state.currentIdx];
+      if (line && pos * 1000 >= line.end_ms && state.followPausedIdx !== state.currentIdx) {
+        state.followPausedIdx = state.currentIdx;
+        mpv('set_property', 'pause', true);
+        osd('跟读暂停');
+      }
+    }
+  }
   const speed = await mpv('get_property', 'speed');
   if (typeof speed === 'number') $('#speed-label').textContent = speed.toFixed(1) + 'x';
   updateBadges();
 }, 300);
 
+// ---------- 状态徽章（点击即关闭对应功能） ----------
 async function updateBadges() {
   const paused = await mpv('get_property', 'pause');
   const abA = await mpv('get_property', 'ab-loop-a');
+  const delay = await mpv('get_property', 'sub-delay');
   const badges = [];
-  if (paused) badges.push('暂停');
-  if (typeof abA === 'number') badges.push('AB循环');
-  if (state.sentenceLoop) badges.push('单句循环');
-  $('#status-badges').textContent = badges.join(' · ');
+  if (paused) badges.push({ id: 'paused', label: '暂停' });
+  if (typeof abA === 'number') badges.push({ id: 'ab', label: 'AB循环' });
+  if (state.sentenceLoop) badges.push({ id: 'loop', label: '单句循环' });
+  if (state.followMode) badges.push({ id: 'follow', label: '跟读' });
+  if (typeof delay === 'number' && Math.abs(delay) > 0.001) {
+    badges.push({ id: 'delay', label: `字幕${delay > 0 ? '+' : ''}${delay.toFixed(1)}s` });
+  }
+  $('#status-badges').innerHTML = badges
+    .map((b) => `<button class="badge" data-badge="${b.id}" title="点击关闭">${b.label}</button>`)
+    .join('');
 }
+
+$('#status-badges').addEventListener('click', (e) => {
+  const b = e.target.closest('.badge');
+  if (!b) return;
+  switch (b.dataset.badge) {
+    case 'paused': mpv('cycle', 'pause'); break;
+    case 'ab':
+      mpv('set_property', 'ab-loop-a', 'no');
+      mpv('set_property', 'ab-loop-b', 'no');
+      state.sentenceLoop = false;
+      break;
+    case 'loop': toggleSentenceLoop(); break;
+    case 'follow': toggleFollow(); break;
+    case 'delay': adjustSubDelay(0, true); break;
+  }
+});
 
 // ---------- 播放控制 ----------
 async function changeSpeed(delta) {
@@ -198,12 +265,27 @@ async function toggleSentenceLoop() {
   }
 }
 
+function toggleFollow() {
+  state.followMode = !state.followMode;
+  state.followPausedIdx = -1;
+  osd(state.followMode ? '跟读模式 开' : '跟读模式 关');
+}
+
+// delta>0 字幕推迟；reset 归零
+async function adjustSubDelay(delta, reset = false) {
+  const cur = reset ? 0 : await mpv('get_property', 'sub-delay');
+  if (typeof cur !== 'number') return;
+  const next = reset ? 0 : Math.round((cur + delta) * 100) / 100;
+  await mpv('set_property', 'sub-delay', next);
+  osd(`字幕延迟 ${next >= 0 ? '+' : ''}${next.toFixed(2)}s`);
+}
+
 $('#transport').addEventListener('click', (e) => {
   const act = e.target.dataset?.act;
   if (!act) return;
   switch (act) {
     case 'prev': mpv('sub-seek', -1); break;
-    case 'toggle': mpv('cycle', 'pause'); break;
+    case 'toggle': state.followPausedIdx = -1; mpv('cycle', 'pause'); break;
     case 'next': mpv('sub-seek', 1); break;
     case 'slower': changeSpeed(-0.1); break;
     case 'faster': changeSpeed(0.1); break;
@@ -217,11 +299,20 @@ document.addEventListener('keydown', (e) => {
 
   switch (true) {
     case e.key === ' ':
-      e.preventDefault(); mpv('cycle', 'pause'); break;
+      e.preventDefault();
+      state.followPausedIdx = -1;
+      mpv('cycle', 'pause');
+      break;
     case e.key === 'ArrowLeft' && !e.altKey:
       mpv('seek', -2, 'relative', 'exact'); break;
     case e.key === 'ArrowRight' && !e.altKey:
       mpv('seek', 2, 'relative', 'exact'); break;
+    case e.key === 'ArrowLeft' && e.altKey:
+      e.preventDefault(); adjustSubDelay(e.shiftKey ? -0.5 : -state.delayStep); break;
+    case e.key === 'ArrowRight' && e.altKey:
+      e.preventDefault(); adjustSubDelay(e.shiftKey ? 0.5 : state.delayStep); break;
+    case e.key === '0' && e.altKey:
+      e.preventDefault(); adjustSubDelay(0, true); break;
     case e.key === 'ArrowUp':
       e.preventDefault(); mpv('sub-seek', -1); break;
     case e.key === 'ArrowDown':
@@ -237,6 +328,7 @@ document.addEventListener('keydown', (e) => {
     case e.key === '[' && e.altKey: e.preventDefault(); nudgeABPoint('a', 0.1); break;
     case e.key === ']' && e.altKey: e.preventDefault(); nudgeABPoint('b', 0.1); break;
     case e.key === 'Enter': toggleSentenceLoop(); break;
+    case e.key === 'r': toggleFollow(); break;
   }
 });
 
@@ -258,6 +350,7 @@ document.addEventListener('keydown', (e) => {
   try {
     const settings = await invoke('get_settings');
     if (settings?.copy?.template) state.copyTemplate = settings.copy.template;
+    if (settings?.subtitle?.delay_step_ms) state.delayStep = settings.subtitle.delay_step_ms / 1000;
   } catch (e) {
     console.warn('settings load failed', e);
   }

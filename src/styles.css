@@ -31,22 +31,35 @@ input, button {
 button { cursor: pointer; }
 button:hover { border-color: var(--accent); }
 
-#conn-bar, #load-bar {
+#conn-bar, #load-bar, #video-bar {
   display: flex;
   gap: 6px;
   padding: 6px 8px;
   align-items: center;
 }
-#conn-bar input, #load-bar input { flex: 1; min-width: 0; }
+#video-bar { background: var(--bg-alt); }
+#conn-bar input, #load-bar input, #video-bar input { flex: 1; min-width: 0; }
 #conn-status { color: var(--fg-dim); white-space: nowrap; font-size: 12px; }
 #conn-status.ok { color: #6fcf6f; }
 
 #status-badges {
-  min-height: 20px;
-  padding: 0 8px;
-  color: var(--accent);
-  font-size: 12px;
+  min-height: 24px;
+  padding: 2px 8px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
 }
+.badge {
+  background: var(--selected);
+  color: #cfe3ff;
+  border: 1px solid #3d6ea5;
+  border-radius: 10px;
+  padding: 1px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.badge:hover { background: #3d6ea5; }
 
 #sentence-list {
   flex: 1;

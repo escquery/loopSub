@@ -7,14 +7,19 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <div id="video-bar">
+    <input id="video-path" placeholder="视频文件路径（自动提取内嵌字幕并播放）" />
+    <button id="btn-play">加载视频</button>
+  </div>
+
   <header id="conn-bar">
-    <input id="socket-path" placeholder="mpv socket，如 /tmp/loopsub-mpv.sock" />
+    <input id="socket-path" placeholder="高级：连接已运行的 mpv socket" />
     <button id="btn-connect">连接</button>
     <span id="conn-status">未连接</span>
   </header>
 
   <div id="load-bar">
-    <input id="srt-path" placeholder="字幕文件路径（.srt）" />
+    <input id="srt-path" placeholder="手动加载字幕文件（.srt，测试用）" />
     <button id="btn-load">加载字幕</button>
   </div>
 

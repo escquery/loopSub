@@ -138,6 +138,63 @@ impl MpvIpc {
     }
 }
 
+/// 默认 IPC 端点（随进程 ID 区分，避免多实例冲突）
+#[cfg(unix)]
+pub fn default_ipc_endpoint() -> String {
+    std::env::temp_dir()
+        .join(format!("loopsub-mpv-{}.sock", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(windows)]
+pub fn default_ipc_endpoint() -> String {
+    format!(r"\\.\pipe\loopsub-mpv-{}", std::process::id())
+}
+
+/// 以“纯显示器”模式拉起 mpv（缴械参数见 DESIGN.md §2）
+pub fn spawn_mpv(endpoint: &str) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(endpoint); // 清理残留 socket
+
+    let mut cmd = std::process::Command::new("mpv");
+    cmd.args([
+        "--idle=yes",
+        "--force-window",
+        &format!("--input-ipc-server={endpoint}"),
+        "--no-osc",
+        "--no-input-default-bindings",
+        "--keep-open=yes",
+        "--sid=no",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    cmd.spawn()
+}
+
+/// 等待 mpv 创建好 socket 后再连接（mpv 启动有延迟）
+pub async fn connect_with_retry(endpoint: &str, attempts: u32) -> Result<MpvIpc, MpvError> {
+    let mut last_err = MpvError::Closed;
+    for _ in 0..attempts {
+        match MpvIpc::connect(endpoint).await {
+            Ok(ipc) => return Ok(ipc),
+            Err(e) => {
+                last_err = e;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    Err(last_err)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
