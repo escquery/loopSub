@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>loopSub</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header id="conn-bar">
+    <input id="socket-path" placeholder="mpv socket，如 /tmp/loopsub-mpv.sock" />
+    <button id="btn-connect">连接</button>
+    <span id="conn-status">未连接</span>
+  </header>
+
+  <div id="load-bar">
+    <input id="srt-path" placeholder="字幕文件路径（.srt）" />
+    <button id="btn-load">加载字幕</button>
+  </div>
+
+  <div id="status-badges"></div>
+
+  <main id="sentence-list"></main>
+
+  <footer id="mini-bar">
+    <div id="current-sentence">—</div>
+    <div id="transport">
+      <button data-act="prev" title="上一句 ↑">⏮</button>
+      <button data-act="toggle" title="播放/暂停 Space">⏯</button>
+      <button data-act="next" title="下一句 ↓">⏭</button>
+      <button data-act="slower" title="减速 x">−</button>
+      <span id="speed-label">1.0x</span>
+      <button data-act="faster" title="加速 c">+</button>
+    </div>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>
