@@ -21,6 +21,7 @@ pub trait Chat: Send + Sync {
     ) -> impl std::future::Future<Output = Result<String, LlmError>> + Send;
 }
 
+#[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,

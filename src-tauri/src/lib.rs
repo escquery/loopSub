@@ -100,12 +100,14 @@ impl AppState {
         bins::resolve(name, dir.as_deref())
     }
 
-    fn llm_tuning(&self) -> (i64, usize, usize) {
+    /// (场景阈值 ms, 最小批行数, 最大批行数, 并发批数)
+    fn llm_tuning(&self) -> (i64, usize, usize, usize) {
         let llm = &self.settings.lock().unwrap().llm;
         (
             (llm.scene_threshold_s * 1000.0) as i64,
             llm.min_batch_lines as usize,
             llm.max_batch_lines as usize,
+            (llm.concurrency as usize).max(1),
         )
     }
 }
@@ -372,11 +374,49 @@ async fn translate_subtitles(
         }
     }
 
-    let (scene_ms, min_b, max_b) = state.llm_tuning();
+    let (scene_ms, min_b, max_b, conc) = state.llm_tuning();
+    let fingerprint = translate::lines_fingerprint(&lines);
+    let mut prog = cache.load_progress(hash, &model);
+    if prog.fingerprint != fingerprint || force {
+        // 换源字幕（行内容变化）或强制重翻：旧断点作废；行缓存仍生效
+        prog = cache::ProgressFile {
+            fingerprint,
+            ..Default::default()
+        };
+    }
+    let mut line_cache = translate::LineCache::load(cache.lines_path(&model));
+
+    let prog = std::sync::Arc::new(std::sync::Mutex::new(prog));
+    // 先取出续翻数据：锁守卫若留在 translate_all 实参表达式里，生命周期会延伸到
+    // .await 语句尾，导致 MutexGuard 跨 await（std MutexGuard 非 Send）
+    let resume = std::mem::take(&mut prog.lock().unwrap().batches);
+    let prog2 = prog.clone();
     let app2 = app.clone();
-    let outcome = translate::translate_all(&client, &lines, scene_ms, min_b, max_b, move |p| {
-        let _ = app2.emit("translate-progress", &p);
-    })
+    let cache2 = cache.clone();
+    let model2 = model.clone();
+    let outcome = translate::translate_all(
+        translate::TranslateOpts {
+            client: &client,
+            lines: &lines,
+            scene_threshold_ms: scene_ms,
+            min_batch: min_b,
+            max_batch: max_b,
+            concurrency: conc,
+            resume,
+            line_cache: Some(&mut line_cache),
+        },
+        move |ev| match ev {
+            translate::TranslateEvent::Progress(p) => {
+                let _ = app2.emit("translate-progress", &p);
+            }
+            translate::TranslateEvent::BatchDone(idx, rows) => {
+                // 批粒度落盘：中断后重启可续翻
+                let mut g = prog2.lock().unwrap();
+                g.batches.insert(idx, rows);
+                let _ = cache2.save_progress(hash, &model2, &g);
+            }
+        },
+    )
     .await;
 
     // 用原文时间轴 + 译文写出 SRT 缓存
@@ -393,6 +433,7 @@ async fn translate_subtitles(
         }
     }
     std::fs::write(&out_path, &srt).map_err(|e| e.to_string())?;
+    cache.delete_progress(hash, &model); // 整集完成，断点文件退役
     Ok(outcome.translations.len())
 }
 

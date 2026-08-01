@@ -3,15 +3,29 @@
 //! <root>/
 //! ├── originals/    提取或下载的字幕原文（<hash>.srt）
 //! ├── truecased/    大写还原结果
-//! ├── translated/   译文（<hash>.<model>.srt）与批粒度进度
+//! ├── translated/   译文（<hash>.<model>.srt）与批粒度进度（<hash>.<model>.progress.json）
+//! ├── lines/        行内容级译文缓存（<model>.jsonl），跨视频复用
 //! └── videos/       按视频 hash 的播放配置（字幕延迟、速度等）
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const MOVIEHASH_CHUNK: usize = 64 * 1024;
 
+/// 翻译断点续翻的进度文件
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProgressFile {
+    /// 原文行指纹：换源字幕导致行内容变化时，旧进度作废
+    #[serde(default)]
+    pub fingerprint: u64,
+    /// 批号（build_batches 顺序号，从 0 计）-> 行号 -> 译文；仅含成功行
+    #[serde(default)]
+    pub batches: BTreeMap<u32, BTreeMap<u32, String>>,
+}
+
+#[derive(Clone)]
 pub struct Cache {
     pub root: PathBuf,
 }
@@ -22,7 +36,7 @@ impl Cache {
     }
 
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
-        for dir in ["originals", "truecased", "translated", "videos"] {
+        for dir in ["originals", "truecased", "translated", "lines", "videos"] {
             std::fs::create_dir_all(self.root.join(dir))?;
         }
         Ok(())
@@ -44,6 +58,34 @@ impl Cache {
 
     pub fn video_config_path(&self, hash: u64) -> PathBuf {
         self.root.join("videos").join(format!("{hash:016x}.json"))
+    }
+
+    pub fn progress_path(&self, hash: u64, model: &str) -> PathBuf {
+        self.root
+            .join("translated")
+            .join(format!("{hash:016x}.{model}.progress.json"))
+    }
+
+    /// 行内容级译文缓存（jsonl：{"h": fnv64(原文), "zh": 译文}）
+    pub fn lines_path(&self, model: &str) -> PathBuf {
+        self.root.join("lines").join(format!("{model}.jsonl"))
+    }
+
+    pub fn load_progress(&self, hash: u64, model: &str) -> ProgressFile {
+        std::fs::read_to_string(self.progress_path(hash, model))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_progress(&self, hash: u64, model: &str, progress: &ProgressFile) -> std::io::Result<()> {
+        let s = serde_json::to_string(progress)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(self.progress_path(hash, model), s)
+    }
+
+    pub fn delete_progress(&self, hash: u64, model: &str) {
+        let _ = std::fs::remove_file(self.progress_path(hash, model));
     }
 }
 
