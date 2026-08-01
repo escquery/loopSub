@@ -1,4 +1,4 @@
-//! loopSub：字幕驱动的美剧学习面板（遥控 mpv）。
+//! loopSub：字幕驱动的美剧学习面板（进程内 libmpv 播放）。
 //! 设计依据见仓库根目录 DESIGN.md。
 
 pub mod anki;
@@ -16,15 +16,14 @@ mod winctl;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use mpv::MpvIpc;
+use mpv::{Mpv, MpvIpc};
 use settings::Settings;
 use tauri::{Emitter, Manager};
 
 pub struct AppState {
     settings: Mutex<Settings>,
     settings_path: PathBuf,
-    mpv: tokio::sync::Mutex<Option<MpvIpc>>,
-    mpv_child: Mutex<Option<std::process::Child>>,
+    mpv: tokio::sync::Mutex<Option<Mpv>>,
     /// 当前加载视频的 hash（播放位置按它存；后端持有，避开 JS f64 存不下 u64 的精度问题）
     current_video: Mutex<Option<u64>>,
 }
@@ -147,28 +146,33 @@ fn load_srt(state: tauri::State<'_, AppState>, path: String) -> Result<Vec<subti
 
 // ---------- mpv 生命周期 ----------
 
-/// 拉起 mpv（若已连接则复用），并应用音频设置
+/// 拉起 mpv（libmpv 进程内实例；已存活则复用，已退出则重建），并应用音频设置
 async fn mpv_start_internal(state: &AppState) -> Result<(), String> {
-    if state.mpv.lock().await.is_some() {
-        return Ok(());
+    let mut guard = state.mpv.lock().await;
+    if let Some(m) = guard.as_ref() {
+        if !m.is_dead() {
+            return Ok(());
+        }
+        // 用户直接关了 mpv 窗口：清理句柄后重建
+        if let Some(Mpv::Embed(e)) = guard.take() {
+            e.shutdown();
+        }
     }
-    let endpoint = mpv::default_ipc_endpoint();
-    let mpv_bin = state.bin("mpv");
-    let child = mpv::spawn_mpv(&endpoint, &mpv_bin).map_err(|e| format!("启动 mpv 失败（未安装？可在设置页指定目录）: {e}"))?;
-    let ipc = mpv::connect_with_retry(&endpoint, 30)
-        .await
-        .map_err(|e| format!("连接 mpv IPC 失败: {e}"))?;
+    let dll = mpv::embed::resolve_dll(state.settings.lock().unwrap().bins.dir.clone())
+        .ok_or("未找到 libmpv 动态库（libmpv-2.dll）：可放至程序目录，或在设置页指定外部程序目录")?;
+    let api = mpv::embed::MpvApi::load(&dll)?;
+    let embed = mpv::embed::MpvEmbed::new(api)?;
+    let m = Mpv::Embed(embed);
 
     let audio = state.audio();
     if audio.dialogue_boost {
-        let _ = ipc.set_property("af", "dynaudnorm".into()).await;
+        let _ = m.set_property("af", "dynaudnorm".into()).await;
     }
     if let Some(vm) = audio.volume_max {
-        let _ = ipc.set_property("volume-max", vm.into()).await;
+        let _ = m.set_property("volume-max", vm.into()).await;
     }
 
-    *state.mpv.lock().await = Some(ipc);
-    *state.mpv_child.lock().unwrap() = Some(child);
+    *guard = Some(m);
     Ok(())
 }
 
@@ -187,11 +191,13 @@ async fn mpv_start(state: tauri::State<'_, AppState>, video_path: Option<String>
 
 #[tauri::command]
 async fn mpv_quit(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if let Some(ipc) = state.mpv.lock().await.take() {
-        let _ = ipc.command(vec!["quit".into()]).await;
-    }
-    if let Some(mut child) = state.mpv_child.lock().unwrap().take() {
-        let _ = child.kill();
+    if let Some(m) = state.mpv.lock().await.take() {
+        match m {
+            Mpv::Embed(e) => e.shutdown(),
+            Mpv::Ipc(i) => {
+                let _ = i.command(vec!["quit".into()]).await;
+            }
+        }
     }
     Ok(())
 }
@@ -200,7 +206,7 @@ async fn mpv_quit(state: tauri::State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn mpv_connect(state: tauri::State<'_, AppState>, socket_path: String) -> Result<(), String> {
     let ipc = MpvIpc::connect(&socket_path).await.map_err(|e| e.to_string())?;
-    *state.mpv.lock().await = Some(ipc);
+    *state.mpv.lock().await = Some(Mpv::Ipc(ipc));
     Ok(())
 }
 
@@ -292,7 +298,8 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
                 path.clone().into(),
                 "replace".into(),
                 (-1).into(),
-                serde_json::json!({ "start": format!("{resume:.3}") }),
+                // options 以 "key=value" 字符串下发，libmpv argv 与 JSON IPC 均如此解析
+                format!("start={resume:.3}").into(),
             ]
         } else {
             vec!["loadfile".into(), path.clone().into()]
@@ -499,12 +506,8 @@ fn get_translation(
 
 /// 召回 mpv 窗口：提升到普通窗口层顶部（面板 always-on-top 仍在它上面）
 #[tauri::command]
-fn recall_mpv(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let pid = state.mpv_child.lock().unwrap().as_ref().map(|c| c.id());
-    match pid {
-        Some(p) => winctl::recall_window_by_pid(p),
-        None => Err("mpv 未由本程序拉起，无法召回".into()),
-    }
+fn recall_mpv() -> Result<(), String> {
+    winctl::recall_mpv_window()
 }
 
 // ---------- 字幕自动对齐 ----------
@@ -818,7 +821,6 @@ pub fn run() {
             settings: Mutex::new(settings),
             settings_path,
             mpv: tokio::sync::Mutex::new(None),
-            mpv_child: Mutex::new(None),
             current_video: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
@@ -848,11 +850,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building loopSub");
 
-    // 退出时带走 mpv 子进程
+    // 退出时销毁 libmpv 实例（terminate_destroy 触发并等待 core 退出）
     app.run(|handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
-            if let Some(mut child) = handle.state::<AppState>().mpv_child.lock().unwrap().take() {
-                let _ = child.kill();
+            let state = handle.state::<AppState>();
+            let taken = state.mpv.blocking_lock().take();
+            if let Some(Mpv::Embed(e)) = taken {
+                e.shutdown();
             }
         }
     });

@@ -23,6 +23,8 @@ dirs = "5"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 base64 = "0.22"
+# libmpv 运行时 dlopen（embed 模式）
+libloading = "0.8"
 
 # Windows 窗口召回（SetWindowPos 提升 mpv 窗口）
 [target.'cfg(windows)'.dependencies]

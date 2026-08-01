@@ -1,9 +1,12 @@
-//! mpv JSON IPC 客户端：跨平台本地套接字 + 请求/响应 + 事件订阅。
+//! mpv 控制：默认进程内 libmpv（embed 子模块，见 embed.rs）；
+//! 手动连接外部已运行 mpv 走 JSON IPC（MpvIpc）。
 //!
 //! - mac/Linux：Unix socket（--input-ipc-server=/tmp/loopsub-mpv.sock）
 //! - Windows：命名管道（--input-ipc-server=\\.\pipe\loopsub-mpv）
 //!
 //! 每行一个 JSON；带 request_id 的是响应，其余是 event。
+
+pub mod embed;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -138,58 +141,38 @@ impl MpvIpc {
     }
 }
 
-/// 默认 IPC 端点（随进程 ID 区分，避免多实例冲突）
-#[cfg(unix)]
-pub fn default_ipc_endpoint() -> String {
-    std::env::temp_dir()
-        .join(format!("loopsub-mpv-{}.sock", std::process::id()))
-        .to_string_lossy()
-        .into_owned()
+/// 统一入口：进程内 libmpv（Embed，默认）或外部 mpv IPC（Ipc，手动连接模式）
+pub enum Mpv {
+    Embed(embed::MpvEmbed),
+    Ipc(MpvIpc),
 }
 
-#[cfg(windows)]
-pub fn default_ipc_endpoint() -> String {
-    format!(r"\\.\pipe\loopsub-mpv-{}", std::process::id())
-}
-
-/// 以“纯显示器”模式拉起 mpv（缴械参数见 DESIGN.md §2）
-/// bin：由 crate::bins::resolve 解析出的 mpv 路径
-pub fn spawn_mpv(endpoint: &str, bin: &std::path::Path) -> std::io::Result<std::process::Child> {
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(endpoint); // 清理残留 socket
-
-    let mut cmd = std::process::Command::new(bin);
-    cmd.args([
-        "--idle=yes",
-        "--force-window",
-        &format!("--input-ipc-server={endpoint}"),
-        "--no-osc",
-        "--no-input-default-bindings",
-        "--keep-open=yes",
-        "--sid=no",
-    ])
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
-
-    crate::bins::no_window(&mut cmd);
-
-    cmd.spawn()
-}
-
-/// 等待 mpv 创建好 socket 后再连接（mpv 启动有延迟）
-pub async fn connect_with_retry(endpoint: &str, attempts: u32) -> Result<MpvIpc, MpvError> {
-    let mut last_err = MpvError::Closed;
-    for _ in 0..attempts {
-        match MpvIpc::connect(endpoint).await {
-            Ok(ipc) => return Ok(ipc),
-            Err(e) => {
-                last_err = e;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+impl Mpv {
+    pub async fn command(&self, args: Vec<Value>) -> Result<Value, MpvError> {
+        match self {
+            Self::Embed(e) => e.command(args).map_err(MpvError::Mpv),
+            Self::Ipc(i) => i.command(args).await,
         }
     }
-    Err(last_err)
+
+    pub async fn get_property(&self, name: &str) -> Result<Value, MpvError> {
+        match self {
+            Self::Embed(e) => e.get_property_value(name).map_err(MpvError::Mpv),
+            Self::Ipc(i) => i.get_property(name).await,
+        }
+    }
+
+    pub async fn set_property(&self, name: &str, value: Value) -> Result<(), MpvError> {
+        match self {
+            Self::Embed(e) => e.set_property_value(name, value).map_err(MpvError::Mpv),
+            Self::Ipc(i) => i.set_property(name, value).await,
+        }
+    }
+
+    /// mpv core 是否已退出（Embed：用户直接关了 mpv 窗口；Ipc 无从感知）
+    pub fn is_dead(&self) -> bool {
+        matches!(self, Self::Embed(e) if e.is_dead())
+    }
 }
 
 #[cfg(all(test, unix))]
