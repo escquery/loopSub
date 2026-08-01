@@ -506,8 +506,16 @@ fn get_translation(
 
 /// 召回 mpv 窗口：提升到普通窗口层顶部（面板 always-on-top 仍在它上面）
 #[tauri::command]
-fn recall_mpv() -> Result<(), String> {
-    winctl::recall_mpv_window()
+async fn recall_mpv(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let guard = state.mpv.lock().await;
+    match guard.as_ref() {
+        Some(Mpv::Embed(e)) => match e.hwnd() {
+            Some(hwnd) => winctl::raise_window(hwnd),
+            // 降级路径（自建窗口失败）：按类名枚举找 mpv 自建窗口
+            None => winctl::recall_mpv_window(),
+        },
+        _ => Err("mpv 未在播放（手动连接模式不支持召回）".into()),
+    }
 }
 
 // ---------- 字幕自动对齐 ----------
@@ -817,6 +825,24 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // 主面板销毁即带走 libmpv：视频窗口是本进程窗口，Tauri 只收自己的
+            // webview 窗口；面板没了，视频窗口就成了没有控制端的孤儿（进程也不退）
+            if let Some(main_win) = app.get_webview_window("main") {
+                let app_handle = app.handle().clone();
+                main_win.on_window_event(move |event| {
+                    if matches!(event, tauri::WindowEvent::Destroyed) {
+                        eprintln!("[win-event] main destroyed, shutdown mpv");
+                        let state = app_handle.state::<AppState>();
+                        let taken = state.mpv.blocking_lock().take();
+                        if let Some(Mpv::Embed(e)) = taken {
+                            e.shutdown();
+                        }
+                    }
+                });
+            }
+            Ok(())
+        })
         .manage(AppState {
             settings: Mutex::new(settings),
             settings_path,
@@ -858,6 +884,12 @@ pub fn run() {
             if let Some(Mpv::Embed(e)) = taken {
                 e.shutdown();
             }
+            eprintln!("[run-event] exit cleanup done, process::exit");
+            // libmpv/WebView2/CRT 多层运行时的退出收尾在 Windows 上会互相等锁
+            // （实测：Exit 后 25 线程全 Wait、进程不散）。我们的资源（mpv core、
+            // 视频窗口、线程）已在 Destroyed/上方主动清理，剩下的交给 OS 回收，
+            // 直接退出进程，跳过不可控的收尾。
+            std::process::exit(0);
         }
     });
 }

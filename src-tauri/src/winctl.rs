@@ -48,6 +48,34 @@ pub fn recall_mpv_window() -> Result<(), String> {
     }
 }
 
+/// 直接按句柄抬窗（Phase B 自建视频窗口，HWND 由 MpvEmbed 持有）
+#[cfg(windows)]
+pub fn raise_window(hwnd: windows_sys::Win32::Foundation::HWND) -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+    unsafe {
+        if SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        ) == 0
+        {
+            return Err("SetWindowPos 失败".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn raise_window(_hwnd: isize) -> Result<(), String> {
+    Err("当前平台暂不支持召回".into())
+}
+
 #[cfg(not(windows))]
 pub fn recall_mpv_window() -> Result<(), String> {
     Err("当前平台暂不支持召回（Windows 用 SetWindowPos，macOS 将用 AX API）".into())

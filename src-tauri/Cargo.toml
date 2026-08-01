@@ -26,6 +26,6 @@ base64 = "0.22"
 # libmpv 运行时 dlopen（embed 模式）
 libloading = "0.8"
 
-# Windows 窗口召回（SetWindowPos 提升 mpv 窗口）
+# Windows 窗口召回（SetWindowPos 提升 mpv 窗口）+ 自建视频窗口
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_LibraryLoader"] }

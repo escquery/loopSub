@@ -40,8 +40,10 @@ pub struct MpvApi {
     client_api_version: unsafe extern "C" fn() -> c_ulong,
     create: unsafe extern "C" fn() -> Handle,
     initialize: unsafe extern "C" fn(Handle) -> c_int,
+    set_option: unsafe extern "C" fn(Handle, *const c_char, c_int, *mut c_void) -> c_int,
     set_option_string: unsafe extern "C" fn(Handle, *const c_char, *const c_char) -> c_int,
     command: unsafe extern "C" fn(Handle, *mut *const c_char) -> c_int,
+    command_string: unsafe extern "C" fn(Handle, *const c_char) -> c_int,
     get_property: unsafe extern "C" fn(Handle, *const c_char, c_int, *mut c_void) -> c_int,
     get_property_string: unsafe extern "C" fn(Handle, *const c_char) -> *mut c_char,
     set_property_string: unsafe extern "C" fn(Handle, *const c_char, *const c_char) -> c_int,
@@ -54,6 +56,12 @@ pub struct MpvApi {
 // client API 文档保证 handle 级函数多线程安全（wait_event 已单线程化）
 unsafe impl Send for MpvApi {}
 unsafe impl Sync for MpvApi {}
+
+impl Drop for MpvApi {
+    fn drop(&mut self) {
+        eprintln!("[embed] MpvApi dropped (FreeLibrary)");
+    }
+}
 
 impl MpvApi {
     pub fn load(path: &Path) -> Result<Arc<Self>, String> {
@@ -70,6 +78,10 @@ impl MpvApi {
                 client_api_version: sym!("mpv_client_api_version", unsafe extern "C" fn() -> c_ulong),
                 create: sym!("mpv_create", unsafe extern "C" fn() -> Handle),
                 initialize: sym!("mpv_initialize", unsafe extern "C" fn(Handle) -> c_int),
+                set_option: sym!(
+                    "mpv_set_option",
+                    unsafe extern "C" fn(Handle, *const c_char, c_int, *mut c_void) -> c_int
+                ),
                 set_option_string: sym!(
                     "mpv_set_option_string",
                     unsafe extern "C" fn(Handle, *const c_char, *const c_char) -> c_int
@@ -77,6 +89,10 @@ impl MpvApi {
                 command: sym!(
                     "mpv_command",
                     unsafe extern "C" fn(Handle, *mut *const c_char) -> c_int
+                ),
+                command_string: sym!(
+                    "mpv_command_string",
+                    unsafe extern "C" fn(Handle, *const c_char) -> c_int
                 ),
                 get_property: sym!(
                     "mpv_get_property",
@@ -160,7 +176,12 @@ pub struct MpvEmbed {
     api: Arc<MpvApi>,
     handle: usize, // 原始指针转 usize 以获得 Send；调用处 cast 回来
     dead: Arc<AtomicBool>,
+    /// 主动关闭中：通知事件线程退出（wait_event 的 unblock 依赖 libmpv，实测偶发失效）
+    closing: Arc<AtomicBool>,
     event_thread: Mutex<Option<JoinHandle<()>>>,
+    /// 自建视频窗口（Phase B）；创建或 wid 设置失败时降级为 mpv 自建窗口
+    #[cfg(windows)]
+    vidwin: Mutex<Option<super::vidwin::VideoWindow>>,
 }
 
 impl MpvEmbed {
@@ -183,22 +204,66 @@ impl MpvEmbed {
             api.check(unsafe { (api.set_option_string)(handle, ck.as_ptr(), cv.as_ptr()) })
                 .map_err(|e| format!("设置 {k}={v} 失败: {e}"))?;
         }
+
+        // Phase B：自建视频窗口 + wid 内嵌；窗口上点 X = 向 core 投递 quit
+        //（与 mpv 自建窗口的默认行为一致）。失败则降级为 mpv 自建窗口。
+        #[cfg(windows)]
+        let vidwin = match super::vidwin::VideoWindow::create({
+            let api = api.clone();
+            let h = handle as usize;
+            move || {
+                let quit = CString::new("quit").unwrap();
+                unsafe { (api.command_string)(h as Handle, quit.as_ptr()) };
+            }
+        }) {
+            Ok(vw) => {
+                let wid = vw.hwnd() as i64;
+                let opt = CString::new("wid").unwrap();
+                let ok = api.check(unsafe {
+                    (api.set_option)(
+                        handle,
+                        opt.as_ptr(),
+                        MPV_FORMAT_INT64,
+                        &wid as *const i64 as *mut c_void,
+                    )
+                });
+                match ok {
+                    Ok(()) => Some(vw),
+                    Err(_) => {
+                        vw.close();
+                        None
+                    }
+                }
+            }
+            Err(_) => None,
+        };
+
         if let Err(e) = api.check(unsafe { (api.initialize)(handle) }) {
             unsafe { (api.terminate_destroy)(handle) };
             return Err(format!("mpv_initialize 失败: {e}"));
         }
 
-        // 事件线程：消费事件队列，侦测 SHUTDOWN（用户直接关了 mpv 窗口）
+        // 事件线程：消费事件队列，侦测 SHUTDOWN（用户直接关了 mpv 窗口）。
+        // wait_event 用 200ms 超时轮询而非永久阻塞：terminate_destroy 的 unblock
+        // 承诺偶发失效（实测 join 永久卡死），超时+closing 标志保证 join 有硬上界。
         let dead = Arc::new(AtomicBool::new(false));
+        let closing = Arc::new(AtomicBool::new(false));
         let event_thread = std::thread::spawn({
             let api = api.clone();
             let dead = dead.clone();
+            let closing = closing.clone();
             let handle = handle as usize;
             move || {
                 let handle = handle as Handle;
                 loop {
-                    let ev = unsafe { (api.wait_event)(handle, -1.0) };
-                    if ev.is_null() || unsafe { (*ev).event_id } == MPV_EVENT_SHUTDOWN {
+                    if closing.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let ev = unsafe { (api.wait_event)(handle, 0.2) };
+                    if closing.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if !ev.is_null() && unsafe { (*ev).event_id } == MPV_EVENT_SHUTDOWN {
                         dead.store(true, Ordering::SeqCst);
                         break;
                     }
@@ -209,7 +274,10 @@ impl MpvEmbed {
             api,
             handle: handle as usize,
             dead,
+            closing,
             event_thread: Mutex::new(Some(event_thread)),
+            #[cfg(windows)]
+            vidwin: Mutex::new(vidwin),
         })
     }
 
@@ -318,13 +386,35 @@ impl MpvEmbed {
         })
     }
 
+    /// 视频窗口句柄（Phase B 自建窗口；降级或非 Windows 为 None）
+    #[cfg(windows)]
+    pub fn hwnd(&self) -> Option<windows_sys::Win32::Foundation::HWND> {
+        self.vidwin.lock().unwrap().as_ref().map(|v| v.hwnd())
+    }
+
+    /// 视频窗口句柄（Phase B 自建窗口；降级或非 Windows 为 None）
+    #[cfg(not(windows))]
+    pub fn hwnd(&self) -> Option<isize> {
+        None
+    }
+
     /// 销毁实例；幂等：core 已自行退出（用户关窗口）时仅清理句柄。
-    /// terminate_destroy 会触发并等待 SHUTDOWN，事件线程随之退出。
+    /// 先置 closing 让事件线程在超时轮询内自行退出（join ≤200ms 有保证），
+    /// 再 terminate_destroy 收尾；不依赖 wait_event 的 unblock 承诺。
     pub fn shutdown(&self) {
-        unsafe { (self.api.terminate_destroy)(self.handle()) };
+        eprintln!("[embed] shutdown: closing + terminate_destroy");
+        self.closing.store(true, Ordering::SeqCst);
         if let Some(t) = self.event_thread.lock().unwrap().take() {
             let _ = t.join();
         }
+        eprintln!("[embed] event thread joined, terminate_destroy");
+        unsafe { (self.api.terminate_destroy)(self.handle()) };
+        #[cfg(windows)]
+        if let Some(vw) = self.vidwin.lock().unwrap().take() {
+            eprintln!("[embed] closing vidwin");
+            vw.close();
+        }
+        eprintln!("[embed] shutdown done");
     }
 }
 

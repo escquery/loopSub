@@ -7,6 +7,9 @@
 //! 每行一个 JSON；带 request_id 的是响应，其余是 event。
 
 pub mod embed;
+/// 自建视频窗口（Phase B，仅 Windows）
+#[cfg(windows)]
+pub mod vidwin;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
