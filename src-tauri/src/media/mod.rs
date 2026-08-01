@@ -121,9 +121,60 @@ pub fn extract_subtitle(video: &Path, track_index: u32, out: &Path, ffmpeg: &Pat
     Ok(())
 }
 
+/// 切一句的音频为 mp3（Anki 卡片素材）。t0/t1 为音频时间轴（秒）。
+/// -ss 在 -i 前：重编码输出下 ffmpeg 会解码到精确点，定位足够准。
+pub fn cut_audio(video: &Path, t0: f64, t1: f64, out: &Path, ffmpeg: &Path) -> Result<(), MediaError> {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-y", "-v", "error", "-ss", &format!("{t0:.3}"), "-to", &format!("{t1:.3}"), "-i"])
+        .arg(video)
+        .args(["-vn", "-ac", "1", "-codec:a", "libmp3lame", "-q:a", "4"])
+        .arg(out);
+    crate::bins::no_window(&mut cmd);
+    let output = cmd.output()?;
+    if !output.status.success() {
+        return Err(MediaError::Ffmpeg(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn ffmpeg_or_skip() -> Option<PathBuf> {
+        let ff = crate::bins::resolve("ffmpeg", None);
+        let ok = std::process::Command::new(&ff)
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        ok.then_some(ff)
+    }
+
+    /// 真跑 ffmpeg：生成 3s 正弦音 → 切 [1.0, 2.2]s → 输出非空 mp3
+    #[test]
+    fn cut_audio_real_ffmpeg() {
+        let Some(ff) = ffmpeg_or_skip() else {
+            eprintln!("skip cut_audio_real_ffmpeg: ffmpeg 不可用");
+            return;
+        };
+        let dir = std::env::temp_dir().join("loopsub-cut-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.wav");
+        let gen = std::process::Command::new(&ff)
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
+            .arg(&src)
+            .output()
+            .unwrap();
+        assert!(gen.status.success());
+        let out = dir.join("clip.mp3");
+        cut_audio(&src, 1.0, 2.2, &out, &ff).unwrap();
+        let size = std::fs::metadata(&out).unwrap().len();
+        assert!(size > 500, "切片文件过小: {size}B");
+    }
 
     #[test]
     fn picks_english_text_track_first() {

@@ -572,7 +572,27 @@ const actions = {
     osd(cur ? '自动收放 关' : '自动收放 开');
   },
   recall_mpv: () => invoke('recall_mpv').then(() => osd('已召回 mpv')).catch(osd),
+  anki_export: () => exportAnki(),
 };
+
+// ---------- Anki 导出（K：截图+音频切片+双语文本 → AnkiConnect/兜底文件） ----------
+async function exportAnki() {
+  const l = state.lines[state.currentIdx];
+  if (!l) return osd('没有当前句');
+  if (!state.videoPath) return osd('请先加载视频');
+  osd('正在导出到 Anki…');
+  try {
+    const msg = await invoke('export_anki_note', {
+      videoHash: state.videoHash,
+      videoPath: state.videoPath,
+      line: l,
+      zh: state.translations[l.number] ?? null,
+    });
+    osd(msg);
+  } catch (e) {
+    osd('Anki 导出失败: ' + e);
+  }
+}
 
 document.addEventListener('keydown', (e) => {
   if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;

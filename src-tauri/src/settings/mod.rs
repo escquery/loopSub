@@ -17,6 +17,7 @@ pub struct Settings {
     pub cache: CacheSettings,
     pub bins: BinSettings,
     pub window: WindowSettings,
+    pub anki: AnkiSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +136,7 @@ impl Default for Settings {
             cache: CacheSettings::default(),
             bins: BinSettings::default(),
             window: WindowSettings::default(),
+            anki: AnkiSettings::default(),
         }
     }
 }
@@ -212,9 +214,31 @@ impl Default for DockSide {
     }
 }
 
+/// Anki 导出配置（AnkiConnect 为主，连不上时降级文件导出）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnkiSettings {
+    /// 目标牌组名
+    pub deck: String,
+    /// 卡片标签（空格分隔）
+    pub tags: String,
+    /// AnkiConnect 地址
+    pub connect_url: String,
+}
+
+impl Default for AnkiSettings {
+    fn default() -> Self {
+        Self {
+            deck: "loopSub".into(),
+            tags: "loopsub".into(),
+            connect_url: "http://127.0.0.1:8765".into(),
+        }
+    }
+}
+
 /// 默认快捷键表（PotPlayer 风格），设置页可全部改绑
 pub fn default_hotkeys() -> HashMap<String, String> {
-    let pairs: [(&str, &str); 25] = [
+    let pairs: [(&str, &str); 26] = [
         ("toggle_pause", "Space"),
         ("seek_back", "ArrowLeft"),
         ("seek_forward", "ArrowRight"),
@@ -240,6 +264,7 @@ pub fn default_hotkeys() -> HashMap<String, String> {
         ("sub_delay_reset", "alt+0"),
         ("toggle_panel", "s"),
         ("recall_mpv", "w"),
+        ("anki_export", "k"),
     ];
     pairs
         .into_iter()

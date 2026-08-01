@@ -42,6 +42,7 @@ const ACTION_LABELS = {
   sub_delay_reset: '字幕延迟归零',
   toggle_panel: '自动收放面板',
   recall_mpv: '召回 mpv 窗口',
+  anki_export: '导出当前句到 Anki',
 };
 
 const tauriInvoke = window.__TAURI__.core.invoke;
@@ -119,6 +120,12 @@ const SettingsUI = {
         <label class="row"><input type="checkbox" data-k="window.sink_on_blur" ${s.window.sink_on_blur ? 'checked' : ''} /> 切走时取消置顶（沉底）</label>
         <label class="row"><input type="checkbox" data-k="window.recall_mpv_on_focus" ${s.window.recall_mpv_on_focus ? 'checked' : ''} /> 切回时召回 mpv 窗口</label>
         <label class="row"><input type="checkbox" data-k="window.float_bar" ${s.window.float_bar ? 'checked' : ''} /> 悬浮字幕条（透明窗浮在视频上，悬停展开操作）</label>
+      </section>
+      <section>
+        <h3>Anki（需装 AnkiConnect 插件并启动 Anki）</h3>
+        <label>牌组名 <input data-k="anki.deck" value="${esc(s.anki.deck)}" /></label>
+        <label>标签（空格分隔） <input data-k="anki.tags" value="${esc(s.anki.tags)}" /></label>
+        <label>AnkiConnect 地址 <input data-k="anki.connect_url" value="${esc(s.anki.connect_url)}" /></label>
       </section>
       <section>
         <h3>快捷键（点击组合键改绑）</h3>

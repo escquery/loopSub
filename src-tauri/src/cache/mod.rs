@@ -43,7 +43,7 @@ impl Cache {
     }
 
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
-        for dir in ["originals", "truecased", "translated", "lines", "videos"] {
+        for dir in ["originals", "truecased", "translated", "lines", "videos", "anki"] {
             std::fs::create_dir_all(self.root.join(dir))?;
         }
         Ok(())
@@ -75,6 +75,16 @@ impl Cache {
     pub fn save_sync_offset(&self, hash: u64, off: SyncOffset) -> std::io::Result<()> {
         let data = serde_json::to_string_pretty(&off).unwrap();
         std::fs::write(self.video_config_path(hash), data)
+    }
+
+    /// Anki 素材暂存（截图/音频切片，推送后可留作复用）
+    pub fn anki_dir(&self) -> PathBuf {
+        self.root.join("anki")
+    }
+
+    /// AnkiConnect 不可用时的兜底导出目录（TSV + 媒体 + 导入说明）
+    pub fn anki_export_dir(&self) -> PathBuf {
+        self.root.join("anki").join("export")
     }
 
     pub fn progress_path(&self, hash: u64, model: &str) -> PathBuf {

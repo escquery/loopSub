@@ -1,6 +1,7 @@
 //! loopSub：字幕驱动的美剧学习面板（遥控 mpv）。
 //! 设计依据见仓库根目录 DESIGN.md。
 
+pub mod anki;
 pub mod cache;
 pub mod media;
 pub mod mpv;
@@ -570,6 +571,120 @@ fn get_sync_offset(state: tauri::State<'_, AppState>, video_hash: u64) -> Option
     state.cache().load_sync_offset(video_hash)
 }
 
+// ---------- Anki 导出 ----------
+
+/// 导出当前句到 Anki：mpv 截图（干净帧）+ ffmpeg 音频切片（字幕时间 × sub-speed
+/// + sub-delay 换算回音频时间轴，前后 0.25s 余量）→ AnkiConnect 推送；
+/// Anki 未启动/未装插件时兜底写入导出目录。返回用户提示语。
+#[tauri::command]
+async fn export_anki_note(
+    state: tauri::State<'_, AppState>,
+    video_hash: u64,
+    video_path: String,
+    line: subtitle::SubtitleLine,
+    zh: Option<String>,
+) -> Result<String, String> {
+    use serde_json::Value;
+    // 1) mpv 侧：取 sub-delay/sub-speed 并下发截图
+    let material = {
+        let guard = state.mpv.lock().await;
+        let ipc = guard.as_ref().ok_or("mpv 未连接")?;
+        let delay = ipc
+            .get_property("sub-delay")
+            .await
+            .ok()
+            .and_then(|v: Value| v.as_f64())
+            .unwrap_or(0.0);
+        let speed = ipc
+            .get_property("sub-speed")
+            .await
+            .ok()
+            .and_then(|v: Value| v.as_f64())
+            .unwrap_or(1.0);
+        let cache = state.cache();
+        let anki_dir = cache.anki_dir();
+        std::fs::create_dir_all(&anki_dir).map_err(|e| e.to_string())?;
+        let stem = format!("loopsub_{video_hash:016x}_{}", line.number);
+        let img = anki_dir.join(format!("{stem}.png"));
+        let _ = std::fs::remove_file(&img); // 清旧文件，轮询只等新文件
+        ipc.command(vec![
+            Value::from("screenshot-to-file"),
+            Value::from(img.to_string_lossy().as_ref()),
+            Value::from("video"),
+        ])
+        .await
+        .map_err(|e| e.to_string())?;
+        // 音频切片参数在锁内算好，出锁再切（不挡播放控制）
+        let t0 = ((line.start_ms as f64 / 1000.0) * speed + delay - 0.25).max(0.0);
+        let t1 = (line.end_ms as f64 / 1000.0) * speed + delay + 0.25;
+        drop(guard);
+
+        // 2) 等截图 + 并行切片（spawn_blocking 不卡 runtime）
+        let ffmpeg = state.bin("ffmpeg");
+        let aud = anki_dir.join(format!("{stem}.mp3"));
+        let video_c = video_path.clone();
+        let aud_c = aud.clone();
+        let cut = tokio::task::spawn_blocking(move || {
+            media::cut_audio(std::path::Path::new(&video_c), t0, t1, &aud_c, &ffmpeg)
+        });
+        let mut shot_ok = false;
+        for _ in 0..40 {
+            if std::fs::metadata(&img).map(|m| m.len() > 0).unwrap_or(false) {
+                shot_ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if !shot_ok {
+            return Err("截图超时（2s）：mpv 未写出文件".into());
+        }
+        cut.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+
+        // 3) 组装素材
+        let stem2 = stem;
+        let title = std::path::Path::new(&video_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mmss = {
+            let s = line.start_ms / 1000;
+            format!("{:02}:{:02}", s / 60, s % 60)
+        };
+        anki::NoteMaterial {
+            image_path: img,
+            audio_path: aud,
+            image_name: format!("{stem2}.png"),
+            audio_name: format!("{stem2}.mp3"),
+            sentence: line.text.clone(),
+            translation: zh.unwrap_or_default(),
+            source: format!("{title} #{} {mmss}", line.number),
+        }
+    };
+
+    // 4) 推送或兜底
+    let (deck, tags, host) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.anki.deck.clone(),
+            s.anki.tags.split_whitespace().map(|t| t.to_string()).collect::<Vec<_>>(),
+            s.anki.connect_url.clone(),
+        )
+    };
+    let ac = anki::AnkiConnect::new(&host);
+    if ac.available().await {
+        anki::push_note(&ac, &deck, &tags, &material)
+            .await
+            .map_err(|e| format!("推送 Anki 失败: {e}"))?;
+        Ok(format!("已加入牌组「{deck}」"))
+    } else {
+        let dir = anki::export_fallback(&state.cache().anki_export_dir(), &material)?;
+        Ok(format!(
+            "Anki 未连接（需装 AnkiConnect 并启动 Anki）— 素材已导出到 {}",
+            dir.display()
+        ))
+    }
+}
+
 /// 悬浮字幕条开关：透明/无边框/置顶/不抢焦点的小窗，浮在视频画面上。
 /// 位置取设置记忆值，缺省为主屏底部居中（约 78% 高度处）。
 #[tauri::command]
@@ -654,6 +769,7 @@ pub fn run() {
             auto_sync_subtitles,
             save_sync_offset,
             get_sync_offset,
+            export_anki_note,
         ])
         .build(tauri::generate_context!())
         .expect("error while building loopSub");
