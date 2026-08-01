@@ -59,10 +59,14 @@ function showNotice(html) {
 }
 
 // ---------- 视频 / 字幕加载 ----------
-$('#btn-play').addEventListener('click', async () => {
-  const path = $('#video-path').value.trim();
-  if (!path) return;
+async function loadVideoFromInput() {
   const btn = $('#btn-play');
+  if (btn.disabled) return; // 加载中，防止回车/拖入重复触发
+  const path = $('#video-path').value.trim();
+  if (!path) {
+    showNotice('请先粘贴视频路径，或直接把视频文件拖进窗口');
+    return;
+  }
   btn.disabled = true;
   btn.textContent = '加载中…';
   try {
@@ -90,6 +94,22 @@ $('#btn-play').addEventListener('click', async () => {
   } finally {
     btn.disabled = false;
     btn.textContent = '加载视频';
+  }
+}
+
+$('#btn-play').addEventListener('click', loadVideoFromInput);
+
+// 输入框回车加载
+$('#video-path').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') loadVideoFromInput();
+});
+
+// 拖入视频文件即加载（Tauri 默认拦截文件拖放并转发为 tauri://drag-drop 事件）
+listen('tauri://drag-drop', (e) => {
+  const paths = e.payload?.paths;
+  if (paths && paths.length > 0) {
+    $('#video-path').value = paths[0];
+    loadVideoFromInput();
   }
 });
 
