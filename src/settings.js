@@ -118,6 +118,7 @@ const SettingsUI = {
         <label class="row"><input type="checkbox" data-k="window.mini_bar" ${s.window.mini_bar ? 'checked' : ''} /> 播放时自动收起为迷你条</label>
         <label class="row"><input type="checkbox" data-k="window.sink_on_blur" ${s.window.sink_on_blur ? 'checked' : ''} /> 切走时取消置顶（沉底）</label>
         <label class="row"><input type="checkbox" data-k="window.recall_mpv_on_focus" ${s.window.recall_mpv_on_focus ? 'checked' : ''} /> 切回时召回 mpv 窗口</label>
+        <label class="row"><input type="checkbox" data-k="window.float_bar" ${s.window.float_bar ? 'checked' : ''} /> 悬浮字幕条（透明窗浮在视频上，悬停展开操作）</label>
       </section>
       <section>
         <h3>快捷键（点击组合键改绑）</h3>

@@ -3,7 +3,7 @@
 'use strict';
 
 const { invoke } = window.__TAURI__.core;
-const { listen } = window.__TAURI__.event;
+const { listen, emit } = window.__TAURI__.event;
 
 // ---------- 全局状态 ----------
 const state = {
@@ -308,6 +308,51 @@ function setCurrent(idx) {
     el.scrollIntoView({ block: 'nearest' });
     $('#current-sentence').textContent = state.lines[idx]?.text ?? '—';
   }
+  emitFloatbarLine();
+}
+
+// ---------- 悬浮字幕条：事件互通 ----------
+function emitFloatbarLine() {
+  if (!floatBarOn) return;
+  const l = state.lines[state.currentIdx];
+  emit('floatbar:line', {
+    en: l?.text ?? '',
+    zh: (l && state.translations[l.number]) || '',
+  });
+}
+
+function emitFloatbarState(paused) {
+  if (!floatBarOn) return;
+  emit('floatbar:state', {
+    paused: !!paused,
+    loop: state.sentenceLoop,
+    follow: state.followMode,
+    zh: state.showZh,
+  });
+}
+
+// 字幕条按钮 → 本面板 actions 表（单一执行点）
+listen('floatbar:action', (e) => {
+  const fn = actions[e.payload];
+  if (fn) fn();
+});
+// 字幕条拖动后记忆位置（防抖由对端做了，这里直接存）
+listen('floatbar:moved', (e) => {
+  if (!state.settings) return;
+  state.settings.window.float_bar_pos = [e.payload.x, e.payload.y];
+  invoke('save_settings', { settings: state.settings }).catch(() => {});
+});
+// 字幕条窗口就绪握手：补发当前句与状态快照
+listen('floatbar:ready', () => {
+  emitFloatbarLine();
+  mpv('get_property', 'pause').then(emitFloatbarState);
+});
+
+let floatBarOn = null;
+function syncFloatBar(on) {
+  if (on === floatBarOn) return;
+  floatBarOn = on;
+  invoke('toggle_float_bar', { enabled: on }).catch((e) => console.warn('floatbar', e));
 }
 
 // ---------- 轮询播放状态 ----------
@@ -352,6 +397,7 @@ async function updateBadges(paused) {
   $('#status-badges').innerHTML = badges
     .map((b) => `<button class="badge" data-badge="${b.id}" title="点击关闭">${b.label}</button>`)
     .join('');
+  emitFloatbarState(paused);
 }
 
 $('#status-badges').addEventListener('click', (e) => {
@@ -462,6 +508,12 @@ const actions = {
       osd(`已选中 #${state.lines[state.currentIdx].number}`);
     }
   },
+  copy_current: () => {
+    if (state.currentIdx < 0) return;
+    state.selected.add(state.currentIdx);
+    syncSelectionUI();
+    copySelected();
+  },
   sub_delay_minus: () => adjustSubDelay(-state.delayStep),
   sub_delay_plus: () => adjustSubDelay(state.delayStep),
   sub_delay_minus_coarse: () => adjustSubDelay(-0.5),
@@ -488,14 +540,19 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ---------- 复制英文（从数据层序列化，绝不包含中文） ----------
-document.addEventListener('keydown', (e) => {
-  if (!(e.ctrlKey || e.metaKey) || e.key !== 'c') return;
+function copySelected() {
   if (state.selected.size === 0) return;
-  e.preventDefault();
   const idxs = [...state.selected].sort((a, b) => a - b);
   const lines = idxs.map((i) => state.lines[i].text).join('\n');
   const out = state.copyTemplate.replace('{lines}', lines);
   navigator.clipboard.writeText(out).then(() => osd(`已复制 ${idxs.length} 句英文`));
+}
+
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.key !== 'c') return;
+  if (state.selected.size === 0) return;
+  e.preventDefault();
+  copySelected();
 });
 
 // ---------- 窗口行为：失焦沉底 / 切回召回 mpv ----------
@@ -522,6 +579,7 @@ function applySettings(s) {
   }
   if (s.copy?.template) state.copyTemplate = s.copy.template;
   if (s.subtitle?.delay_step_ms) state.delayStep = s.subtitle.delay_step_ms / 1000;
+  syncFloatBar(s.window?.float_bar ?? false);
 }
 
 window.addEventListener('settings-saved', (e) => applySettings(e.detail));

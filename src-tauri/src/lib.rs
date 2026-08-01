@@ -479,6 +479,52 @@ fn recall_mpv(state: tauri::State<'_, AppState>) -> Result<(), String> {
     }
 }
 
+/// 悬浮字幕条开关：透明/无边框/置顶/不抢焦点的小窗，浮在视频画面上。
+/// 位置取设置记忆值，缺省为主屏底部居中（约 78% 高度处）。
+#[tauri::command]
+async fn toggle_float_bar(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("floatbar") {
+        let r = if enabled { w.show() } else { w.close() };
+        return r.map_err(|e| e.to_string());
+    }
+    if !enabled {
+        return Ok(()); // 未创建且要求关闭：无操作
+    }
+    let main = app.get_webview_window("main").ok_or("主窗口不存在")?;
+    let monitor = main
+        .current_monitor()
+        .map_err(|e| e.to_string())?
+        .ok_or("无法获取显示器信息")?;
+    let screen = monitor.size();
+    let (w, h) = (760.0_f64, 150.0_f64);
+    let pos = state.settings.lock().unwrap().window.float_bar_pos;
+    let (x, y) = match pos {
+        Some((x, y)) => (x as f64, y as f64),
+        None => (
+            (screen.width as f64 - w) / 2.0,
+            screen.height as f64 * 0.78,
+        ),
+    };
+    tauri::WebviewWindowBuilder::new(&app, "floatbar", tauri::WebviewUrl::App("floatbar.html".into()))
+        .title("loopSub 字幕条")
+        .transparent(true)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focusable(false)
+        .shadow(false)
+        .resizable(false)
+        .inner_size(w, h)
+        .position(x, y)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn set_always_on_top(window: tauri::Window, flag: bool) -> Result<(), String> {
     window.set_always_on_top(flag).map_err(|e| e.to_string())
@@ -513,6 +559,7 @@ pub fn run() {
             get_translation,
             recall_mpv,
             set_always_on_top,
+            toggle_float_bar,
         ])
         .build(tauri::generate_context!())
         .expect("error while building loopSub");

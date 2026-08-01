@@ -105,6 +105,12 @@ pub struct WindowSettings {
     pub sink_on_blur: bool,
     /// 切回面板时主动召回 mpv 窗口到面板下方
     pub recall_mpv_on_focus: bool,
+    /// 悬浮字幕条（透明置顶窗，浮在视频画面上；hover 展开操作）
+    #[serde(default)]
+    pub float_bar: bool,
+    /// 悬浮条位置记忆（屏幕物理坐标）；None = 默认底部居中
+    #[serde(default)]
+    pub float_bar_pos: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +188,8 @@ impl Default for WindowSettings {
             mini_bar: true,
             sink_on_blur: true,
             recall_mpv_on_focus: true,
+            float_bar: false,
+            float_bar_pos: None,
         }
     }
 }

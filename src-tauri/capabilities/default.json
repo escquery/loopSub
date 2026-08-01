@@ -1,12 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for the main window",
-  "windows": ["main"],
+  "description": "Default capabilities for the main and floatbar windows",
+  "windows": ["main", "floatbar"],
   "permissions": [
     "core:default",
     "core:event:default",
     "core:window:allow-set-always-on-top",
-    "core:window:allow-set-size"
+    "core:window:allow-set-size",
+    "core:window:allow-start-dragging"
   ]
 }
