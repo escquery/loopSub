@@ -12,6 +12,7 @@ const state = {
   videoHash: '',
   videoPath: '',
   connected: false,
+  loading: false,
   currentIdx: -1,
   selected: new Set(),
   lastClickIdx: -1,
@@ -59,16 +60,10 @@ function showNotice(html) {
 }
 
 // ---------- 视频 / 字幕加载 ----------
-async function loadVideoFromInput() {
-  const btn = $('#btn-play');
-  if (btn.disabled) return; // 加载中，防止回车/拖入重复触发
-  const path = $('#video-path').value.trim();
-  if (!path) {
-    showNotice('请先粘贴视频路径，或直接把视频文件拖进窗口');
-    return;
-  }
-  btn.disabled = true;
-  btn.textContent = '加载中…';
+async function loadVideo(path) {
+  if (state.loading) return; // 加载中，防止重复触发
+  state.loading = true;
+  showNotice('<span class="dim">正在打开视频…</span>');
   try {
     const res = await invoke('load_video', { path });
     state.videoPath = path;
@@ -89,29 +84,83 @@ async function loadVideoFromInput() {
       osd(`字幕来源：${res.source === 'cache' ? '缓存' : '内嵌提取'}`);
       loadCachedTranslation();
     }
+    if (res.resume_s >= 5) osd(`已从 ${fmtTime(res.resume_s * 1000)} 续播`);
   } catch (e) {
     showNotice('加载视频失败: ' + esc(String(e)));
   } finally {
-    btn.disabled = false;
-    btn.textContent = '加载视频';
+    state.loading = false;
+    refreshHistory();
   }
 }
 
-$('#btn-play').addEventListener('click', loadVideoFromInput);
+// 📂 原生文件对话框选视频（Rust 侧 pick_video 调起）
+$('#btn-browse').addEventListener('click', async () => {
+  try {
+    const path = await invoke('pick_video');
+    if (path) loadVideo(path);
+  } catch (e) {
+    showNotice('打开文件对话框失败: ' + esc(String(e)));
+  }
+});
 
-// 输入框回车加载
-$('#video-path').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') loadVideoFromInput();
+// 后端分阶段推送加载进度（探测/提取字幕/启动播放器），首次打开不再“卡死”
+listen('video-load-progress', (e) => {
+  showNotice(`<span class="dim">${esc(String(e.payload))}</span>`);
+});
+
+// 历史记录下拉（页面内渲染，原生 select 弹出层会被置顶面板盖住）
+async function refreshHistory() {
+  let entries = [];
+  try {
+    entries = await invoke('get_history');
+  } catch {
+    return;
+  }
+  $('#history-label').textContent = state.videoPath
+    ? state.videoPath.split(/[\\/]/).pop()
+    : entries.length
+      ? '最近播放'
+      : '暂无播放记录';
+  $('#history-list').innerHTML = entries
+    .map(
+      (e) =>
+        `<div class="history-item" data-path="${esc(e.path)}" title="${esc(e.path)}">${esc(e.path.split(/[\\/]/).pop())}</div>`
+    )
+    .join('');
+}
+
+$('#history-box').addEventListener('click', (e) => {
+  if (e.target.closest('.history-item')) return; // 条目点击由下面代理处理
+  $('#history-list').classList.toggle('hidden');
+});
+
+$('#history-list').addEventListener('click', (e) => {
+  const item = e.target.closest('.history-item');
+  if (!item) return;
+  $('#history-list').classList.add('hidden');
+  const p = item.dataset.path;
+  if (p && p !== state.videoPath) loadVideo(p);
+});
+
+// 点击下拉外任意处收起
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#history-box')) $('#history-list').classList.add('hidden');
 });
 
 // 拖入视频文件即加载（Tauri 默认拦截文件拖放并转发为 tauri://drag-drop 事件）
 listen('tauri://drag-drop', (e) => {
   const paths = e.payload?.paths;
-  if (paths && paths.length > 0) {
-    $('#video-path').value = paths[0];
-    loadVideoFromInput();
-  }
+  if (paths && paths.length > 0) loadVideo(paths[0]);
 });
+
+// 播放位置记忆：每 5s 上报一次（异常退出最多丢 5s）
+setInterval(async () => {
+  if (!state.connected || !state.videoPath) return;
+  const pos = await mpv('get_property', 'time-pos');
+  if (typeof pos === 'number' && pos > 0) {
+    invoke('save_playback_position', { positionS: pos }).catch(() => {});
+  }
+}, 5000);
 
 // 手动连接已运行的 mpv（高级）
 $('#btn-connect').addEventListener('click', async () => {
@@ -676,4 +725,5 @@ window.addEventListener('settings-saved', (e) => applySettings(e.detail));
   } catch (e) {
     console.warn('settings load failed', e);
   }
+  refreshHistory();
 })();

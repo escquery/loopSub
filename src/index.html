@@ -8,8 +8,12 @@
 </head>
 <body>
   <div id="top-bar">
-    <input id="video-path" placeholder="视频文件路径（自动提取内嵌字幕并播放）" />
-    <button id="btn-play">加载视频</button>
+    <button id="btn-browse" title="打开视频文件…">📂</button>
+    <div id="history-box">
+      <span id="history-label">暂无播放记录</span>
+      <span id="history-arrow">▾</span>
+      <div id="history-list" class="hidden"></div>
+    </div>
     <button id="btn-open-search" title="搜索字幕">🔍</button>
     <button id="btn-settings" title="设置">⚙</button>
   </div>
