@@ -14,6 +14,13 @@ use std::path::{Path, PathBuf};
 
 const MOVIEHASH_CHUNK: usize = 64 * 1024;
 
+/// 自动对齐结果（按视频持久化，下次打开自动应用）
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct SyncOffset {
+    pub delay_s: f64,
+    pub speed: f64,
+}
+
 /// 翻译断点续翻的进度文件
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProgressFile {
@@ -58,6 +65,16 @@ impl Cache {
 
     pub fn video_config_path(&self, hash: u64) -> PathBuf {
         self.root.join("videos").join(format!("{hash:016x}.json"))
+    }
+
+    pub fn load_sync_offset(&self, hash: u64) -> Option<SyncOffset> {
+        let data = std::fs::read_to_string(self.video_config_path(hash)).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    pub fn save_sync_offset(&self, hash: u64, off: SyncOffset) -> std::io::Result<()> {
+        let data = serde_json::to_string_pretty(&off).unwrap();
+        std::fs::write(self.video_config_path(hash), data)
     }
 
     pub fn progress_path(&self, hash: u64, model: &str) -> PathBuf {

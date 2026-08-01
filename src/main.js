@@ -74,6 +74,7 @@ $('#btn-play').addEventListener('click', async () => {
     state.currentIdx = -1;
     state.selected.clear();
     markConnected();
+    applySavedSyncOffset();
     renderList();
     $('#trans-bar').classList.toggle('hidden', state.lines.length === 0);
     if (res.notice) {
@@ -479,8 +480,53 @@ $('#transport').addEventListener('click', (e) => {
     case 'next': mpv('sub-seek', 1); break;
     case 'slower': changeSpeed(-0.1); break;
     case 'faster': changeSpeed(0.1); break;
+    case 'autosync': autoSync(); break;
   }
 });
+
+// ---------- 字幕自动对齐（能量包络互相关；结果只写 mpv 属性，可逆） ----------
+function fmtSyncOffset(delayS, speed) {
+  return `${delayS >= 0 ? '+' : ''}${delayS.toFixed(2)}s` + (speed !== 1 ? ` ×${speed.toFixed(4)}` : '');
+}
+
+async function autoSync() {
+  if (!state.videoPath || state.lines.length === 0) return osd('请先加载视频和字幕');
+  const btn = document.querySelector('[data-act="autosync"]');
+  btn.disabled = true;
+  osd('正在分析音频并对齐字幕…');
+  try {
+    const r = await invoke('auto_sync_subtitles', {
+      videoPath: state.videoPath,
+      lines: state.lines,
+      searchS: 30,
+    });
+    await mpv('set_property', 'sub-delay', r.delay_s);
+    await mpv('set_property', 'sub-speed', r.speed);
+    await invoke('save_sync_offset', {
+      videoHash: state.videoHash,
+      offset: { delay_s: r.delay_s, speed: r.speed },
+    });
+    osd(`字幕已对齐（${r.segments_ok}/${r.segments_total} 段）：${fmtSyncOffset(r.delay_s, r.speed)}`);
+  } catch (e) {
+    osd('自动对齐失败: ' + e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// 加载视频后恢复上次保存的对齐结果
+async function applySavedSyncOffset() {
+  try {
+    const off = await invoke('get_sync_offset', { videoHash: state.videoHash });
+    if (off) {
+      await mpv('set_property', 'sub-delay', off.delay_s);
+      await mpv('set_property', 'sub-speed', off.speed);
+      osd(`已恢复对齐：${fmtSyncOffset(off.delay_s, off.speed)}`);
+    }
+  } catch {
+    /* 无保存结果或 mpv 未就绪：静默 */
+  }
+}
 
 // ---------- 快捷键（数据驱动：combo → action，设置页可全部改绑） ----------
 const actions = {

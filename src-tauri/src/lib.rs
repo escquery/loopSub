@@ -7,6 +7,7 @@ pub mod mpv;
 pub mod opensub;
 pub mod settings;
 pub mod subtitle;
+pub mod sync;
 pub mod translate;
 mod bins;
 mod winctl;
@@ -479,6 +480,96 @@ fn recall_mpv(state: tauri::State<'_, AppState>) -> Result<(), String> {
     }
 }
 
+// ---------- 字幕自动对齐 ----------
+
+#[derive(serde::Serialize)]
+struct SyncResult {
+    delay_s: f64,
+    speed: f64,
+    drift: bool,
+    segments_ok: usize,
+    segments_total: usize,
+}
+
+/// ffmpeg 提全片 8kHz 单声道 PCM（1h ≈ 58MB 原始数据，提取速度数倍于实时）
+async fn extract_pcm(ffmpeg: &std::path::Path, video: &str) -> Result<Vec<i16>, String> {
+    let out = tokio::process::Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            video,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            &sync::SAMPLE_RATE.to_string(),
+            "-f",
+            "s16le",
+            "-",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("ffmpeg 启动失败: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("ffmpeg 提取音频失败: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(out
+        .stdout
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect())
+}
+
+/// 自动对齐字幕：能量包络互相关估偏移 → 映射 mpv sub-delay / sub-speed。
+/// 行数据由前端传入（后端不持有字幕状态）；结果由前端下发 mpv 并持久化。
+#[tauri::command]
+async fn auto_sync_subtitles(
+    state: tauri::State<'_, AppState>,
+    video_path: String,
+    lines: Vec<subtitle::SubtitleLine>,
+    search_s: Option<f64>,
+) -> Result<SyncResult, String> {
+    let ffmpeg = state.bin("ffmpeg");
+    let pcm = extract_pcm(&ffmpeg, &video_path).await?;
+    // 全片互相关约 1 亿次乘加：阻塞任务丢到线程池，别卡 async runtime
+    let est = tokio::task::spawn_blocking(move || {
+        let audio = sync::energy_envelope(&pcm);
+        let n = audio.len();
+        let subs = sync::subtitle_envelope(&lines, n);
+        sync::estimate(&audio, &subs, search_s.unwrap_or(30.0))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("音频语音太少或字幕与音轨不匹配，请手动微调（Alt+←→）")?;
+    Ok(SyncResult {
+        delay_s: est.delay_s,
+        speed: est.speed,
+        drift: est.drift,
+        segments_ok: est.segments_ok,
+        segments_total: est.segments_total,
+    })
+}
+
+/// 持久化对齐结果（下次打开同一视频自动应用）
+#[tauri::command]
+fn save_sync_offset(
+    state: tauri::State<'_, AppState>,
+    video_hash: u64,
+    offset: cache::SyncOffset,
+) -> Result<(), String> {
+    state
+        .cache()
+        .save_sync_offset(video_hash, offset)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_sync_offset(state: tauri::State<'_, AppState>, video_hash: u64) -> Option<cache::SyncOffset> {
+    state.cache().load_sync_offset(video_hash)
+}
+
 /// 悬浮字幕条开关：透明/无边框/置顶/不抢焦点的小窗，浮在视频画面上。
 /// 位置取设置记忆值，缺省为主屏底部居中（约 78% 高度处）。
 #[tauri::command]
@@ -560,6 +651,9 @@ pub fn run() {
             recall_mpv,
             set_always_on_top,
             toggle_float_bar,
+            auto_sync_subtitles,
+            save_sync_offset,
+            get_sync_offset,
         ])
         .build(tauri::generate_context!())
         .expect("error while building loopSub");
