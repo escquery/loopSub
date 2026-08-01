@@ -25,6 +25,8 @@ pub struct AppState {
     settings_path: PathBuf,
     mpv: tokio::sync::Mutex<Option<MpvIpc>>,
     mpv_child: Mutex<Option<std::process::Child>>,
+    /// 当前加载视频的 hash（播放位置按它存；后端持有，避开 JS f64 存不下 u64 的精度问题）
+    current_video: Mutex<Option<u64>>,
 }
 
 impl AppState {
@@ -219,36 +221,46 @@ async fn mpv_command(
 /// 文本字幕到缓存目录；最后拉起 mpv 播放。无内嵌文本轨时降级为 notice，
 /// 由前端走 OpenSubtitles 搜索流程。
 #[tauri::command]
-async fn load_video(state: tauri::State<'_, AppState>, path: String) -> Result<media::LoadVideoResult, String> {
+async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: String) -> Result<media::LoadVideoResult, String> {
     let video = PathBuf::from(&path);
     if !video.exists() {
+        // 历史里的失效记录顺手剔除
+        let _ = state.cache().remove_history(&path);
         return Err("视频文件不存在".into());
     }
     let cache = state.cache();
     cache.ensure_dirs().map_err(|e| e.to_string())?;
     let hash = cache::moviehash(&video).map_err(|e| e.to_string())?;
+    *state.current_video.lock().unwrap() = Some(hash);
     let original = cache.original_path(hash);
+    // 续播位置（≥5s 才生效，loadfile 时作为 start 选项下发）
+    let resume = cache.load_video_config(hash).position_s;
 
     let mut notice = None;
     let source = if original.exists() {
         "cache"
     } else {
+        let _ = app.emit("video-load-progress", "正在探测字幕轨…");
         let v = video.clone();
-        let out = original.clone();
         let ffprobe = state.bin("ffprobe");
-        let ffmpeg = state.bin("ffmpeg");
-        let extracted = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let tracks = media::probe_subtitles(&v, &ffprobe).map_err(|e| e.to_string())?;
-            match media::pick_text_track(&tracks) {
-                Some(track) => {
-                    media::extract_subtitle(&v, track.index, &out, &ffmpeg).map_err(|e| e.to_string())?;
-                    Ok(true)
-                }
-                None => Ok(false),
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        let tracks = tokio::task::spawn_blocking(move || media::probe_subtitles(&v, &ffprobe))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let extracted = if let Some(track) = media::pick_text_track(&tracks) {
+            let _ = app.emit("video-load-progress", "正在提取内嵌字幕（首次打开较慢）…");
+            let v = video.clone();
+            let out = original.clone();
+            let ffmpeg = state.bin("ffmpeg");
+            let idx = track.index;
+            tokio::task::spawn_blocking(move || media::extract_subtitle(&v, idx, &out, &ffmpeg))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            true
+        } else {
+            false
+        };
         if extracted {
             "embedded"
         } else {
@@ -269,23 +281,37 @@ async fn load_video(state: tauri::State<'_, AppState>, path: String) -> Result<m
     }
 
     // 拉起 mpv 并播放（无字幕也先播，等用户搜索）；面板渲染模式下关掉 mpv 自带字幕
+    let _ = app.emit("video-load-progress", "正在启动播放器…");
     mpv_start_internal(&state).await?;
     {
         let guard = state.mpv.lock().await;
         let ipc = guard.as_ref().unwrap();
-        ipc.command(vec!["loadfile".into(), path.clone().into()])
-            .await
-            .map_err(|e| e.to_string())?;
+        let args = if resume >= 5.0 {
+            vec![
+                "loadfile".into(),
+                path.clone().into(),
+                "replace".into(),
+                (-1).into(),
+                serde_json::json!({ "start": format!("{resume:.3}") }),
+            ]
+        } else {
+            vec!["loadfile".into(), path.clone().into()]
+        };
+        ipc.command(args).await.map_err(|e| e.to_string())?;
         if state.panel_render() {
             let _ = ipc.set_property("sub-visibility", false.into()).await;
         }
     }
+
+    // 成功加载后写入历史记录（MRU 置顶）
+    let _ = cache.touch_history(&path);
 
     Ok(media::LoadVideoResult {
         lines,
         source: source.into(),
         video_hash: format!("{hash:016x}"),
         notice,
+        resume_s: resume,
     })
 }
 
@@ -557,18 +583,34 @@ async fn auto_sync_subtitles(
 #[tauri::command]
 fn save_sync_offset(
     state: tauri::State<'_, AppState>,
-    video_hash: u64,
+    video_hash: String,
     offset: cache::SyncOffset,
 ) -> Result<(), String> {
+    let hash = u64::from_str_radix(&video_hash, 16).map_err(|e| e.to_string())?;
     state
         .cache()
-        .save_sync_offset(video_hash, offset)
+        .save_sync_offset(hash, offset)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn get_sync_offset(state: tauri::State<'_, AppState>, video_hash: u64) -> Option<cache::SyncOffset> {
-    state.cache().load_sync_offset(video_hash)
+fn get_sync_offset(state: tauri::State<'_, AppState>, video_hash: String) -> Option<cache::SyncOffset> {
+    let hash = u64::from_str_radix(&video_hash, 16).ok()?;
+    state.cache().load_sync_offset(hash)
+}
+
+/// 历史打开记录（MRU 最新在前）
+#[tauri::command]
+fn get_history(state: tauri::State<'_, AppState>) -> Vec<cache::HistoryEntry> {
+    state.cache().load_history()
+}
+
+/// 播放位置记忆：前端周期性上报，按后端持有的当前视频 hash 存
+#[tauri::command]
+fn save_playback_position(state: tauri::State<'_, AppState>, position_s: f64) {
+    if let Some(hash) = *state.current_video.lock().unwrap() {
+        let _ = state.cache().save_position(hash, position_s.max(0.0));
+    }
 }
 
 // ---------- Anki 导出 ----------
@@ -579,12 +621,13 @@ fn get_sync_offset(state: tauri::State<'_, AppState>, video_hash: u64) -> Option
 #[tauri::command]
 async fn export_anki_note(
     state: tauri::State<'_, AppState>,
-    video_hash: u64,
+    video_hash: String,
     video_path: String,
     line: subtitle::SubtitleLine,
     zh: Option<String>,
 ) -> Result<String, String> {
     use serde_json::Value;
+    let video_hash = u64::from_str_radix(&video_hash, 16).map_err(|e| e.to_string())?;
     // 1) mpv 侧：取 sub-delay/sub-speed 并下发截图
     let material = {
         let guard = state.mpv.lock().await;
@@ -736,6 +779,32 @@ fn set_always_on_top(window: tauri::Window, flag: bool) -> Result<(), String> {
     window.set_always_on_top(flag).map_err(|e| e.to_string())
 }
 
+/// 原生文件对话框选视频（Rust 侧调起，前端无需 dialog 插件权限）
+/// 置顶的面板会盖住非置顶对话框：打开期间临时取消置顶，选完恢复原状
+#[tauri::command]
+async fn pick_video(window: tauri::Window) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    let was_top = window.is_always_on_top().unwrap_or(false);
+    if was_top {
+        let _ = window.set_always_on_top(false);
+    }
+    let picked = window
+        .dialog()
+        .file()
+        .add_filter(
+            "视频文件",
+            &[
+                "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "ts", "m2ts", "mpg",
+                "mpeg", "rmvb",
+            ],
+        )
+        .blocking_pick_file();
+    if was_top {
+        let _ = window.set_always_on_top(true);
+    }
+    picked.map(|f| f.to_string())
+}
+
 pub fn run() {
     let settings_path = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -744,11 +813,13 @@ pub fn run() {
     let settings = Settings::load(&settings_path).unwrap_or_default();
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             settings: Mutex::new(settings),
             settings_path,
             mpv: tokio::sync::Mutex::new(None),
             mpv_child: Mutex::new(None),
+            current_video: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
@@ -765,10 +836,13 @@ pub fn run() {
             get_translation,
             recall_mpv,
             set_always_on_top,
+            pick_video,
             toggle_float_bar,
             auto_sync_subtitles,
             save_sync_offset,
             get_sync_offset,
+            get_history,
+            save_playback_position,
             export_anki_note,
         ])
         .build(tauri::generate_context!())

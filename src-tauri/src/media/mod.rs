@@ -42,6 +42,8 @@ pub struct LoadVideoResult {
     pub source: String,
     pub video_hash: String,
     pub notice: Option<String>,
+    /// 续播位置（秒）；< 5 表示从头播
+    pub resume_s: f64,
 }
 
 pub fn probe_subtitles(video: &Path, ffprobe: &Path) -> Result<Vec<SubTrack>, MediaError> {

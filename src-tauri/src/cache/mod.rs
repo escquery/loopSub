@@ -5,7 +5,8 @@
 //! ├── truecased/    大写还原结果
 //! ├── translated/   译文（<hash>.<model>.srt）与批粒度进度（<hash>.<model>.progress.json）
 //! ├── lines/        行内容级译文缓存（<model>.jsonl），跨视频复用
-//! └── videos/       按视频 hash 的播放配置（字幕延迟、速度等）
+//! ├── videos/       按视频 hash 的播放配置（字幕延迟、速度、播放位置）
+//! └── history.json  历史打开记录（MRU 最新在前）
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -19,6 +20,30 @@ const MOVIEHASH_CHUNK: usize = 64 * 1024;
 pub struct SyncOffset {
     pub delay_s: f64,
     pub speed: f64,
+}
+
+/// 每视频播放配置（videos/<hash>.json）：字幕延迟/速度/播放位置。
+/// 字段全带 serde(default)，旧的只含 delay_s/speed 的文件可直接读入。
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct VideoConfig {
+    #[serde(default)]
+    pub delay_s: f64,
+    #[serde(default)]
+    pub speed: f64,
+    /// 上次播放位置（秒）；< 5 视为从头播
+    #[serde(default)]
+    pub position_s: f64,
+}
+
+/// 历史记录上限
+pub const MAX_HISTORY: usize = 20;
+
+/// 一条历史打开记录
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    pub path: String,
+    /// 上次打开的 unix 秒
+    pub last_opened: i64,
 }
 
 /// 翻译断点续翻的进度文件
@@ -69,12 +94,88 @@ impl Cache {
 
     pub fn load_sync_offset(&self, hash: u64) -> Option<SyncOffset> {
         let data = std::fs::read_to_string(self.video_config_path(hash)).ok()?;
-        serde_json::from_str(&data).ok()
+        let cfg: VideoConfig = serde_json::from_str(&data).ok()?;
+        Some(SyncOffset {
+            delay_s: cfg.delay_s,
+            speed: cfg.speed,
+        })
     }
 
     pub fn save_sync_offset(&self, hash: u64, off: SyncOffset) -> std::io::Result<()> {
-        let data = serde_json::to_string_pretty(&off).unwrap();
+        let mut cfg = self.load_video_config(hash);
+        cfg.delay_s = off.delay_s;
+        cfg.speed = off.speed;
+        self.save_video_config(hash, &cfg)
+    }
+
+    /// 读每视频配置；文件缺失或损坏时回落默认（全 0）
+    pub fn load_video_config(&self, hash: u64) -> VideoConfig {
+        std::fs::read_to_string(self.video_config_path(hash))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_video_config(&self, hash: u64, cfg: &VideoConfig) -> std::io::Result<()> {
+        let data = serde_json::to_string_pretty(cfg).unwrap();
         std::fs::write(self.video_config_path(hash), data)
+    }
+
+    /// 记播放位置（读改写，不动延迟/速度字段）
+    pub fn save_position(&self, hash: u64, pos_s: f64) -> std::io::Result<()> {
+        let mut cfg = self.load_video_config(hash);
+        cfg.position_s = pos_s;
+        self.save_video_config(hash, &cfg)
+    }
+
+    // ---------- 历史打开记录 ----------
+
+    pub fn history_path(&self) -> PathBuf {
+        self.root.join("history.json")
+    }
+
+    pub fn load_history(&self) -> Vec<HistoryEntry> {
+        std::fs::read_to_string(self.history_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_history(&self, entries: &[HistoryEntry]) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.root)?;
+        let data = serde_json::to_string_pretty(entries)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(self.history_path(), data)
+    }
+
+    /// 打开记录置顶（按路径去重，MRU，截断到上限）
+    pub fn touch_history(&self, path: &str) -> std::io::Result<()> {
+        let mut entries = self.load_history();
+        entries.retain(|e| e.path != path);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        entries.insert(
+            0,
+            HistoryEntry {
+                path: path.to_string(),
+                last_opened: ts,
+            },
+        );
+        entries.truncate(MAX_HISTORY);
+        self.save_history(&entries)
+    }
+
+    /// 剔除失效记录（文件已删除等）
+    pub fn remove_history(&self, path: &str) -> std::io::Result<()> {
+        let mut entries = self.load_history();
+        let before = entries.len();
+        entries.retain(|e| e.path != path);
+        if entries.len() != before {
+            self.save_history(&entries)?;
+        }
+        Ok(())
     }
 
     /// Anki 素材暂存（截图/音频切片，推送后可留作复用）
