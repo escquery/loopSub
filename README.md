@@ -10,16 +10,16 @@
 
 ```
 ┌────────────────────────────────────┐
-│  mpv 窗口（最大化当背景，被动显示） │
+│  视频窗口（libmpv 渲染，被动显示）  │
 │         ┌───────────────┐          │
 │         │ loopSub 面板   │ ← 唯一焦点│
 │         └───────────────┘          │
 └────────────────────────────────────┘
-loopSub ──JSON IPC──> mpv        （播放控制全部走 IPC）
+loopSub ──C API──> libmpv         （播放控制全部进程内调用）
 loopSub ──spawn──> ffmpeg/ffprobe （字幕探测与导出）
 ```
 
-由此不需要全局热键（按键都是面板内普通事件），mpv 以 `--no-osc --no-input-default-bindings` 缴械启动，生命周期随应用。
+由此不需要全局热键（按键都是面板内普通事件）。libmpv 以 dlopen 方式进程内加载（无子进程、无 IPC 连接与重试），以 `osc=no input-default-bindings=no` 缴械初始化；视频窗口为应用自建 Win32 窗口（wid 内嵌），生命周期随应用。
 
 ## 功能
 
@@ -53,8 +53,8 @@ loopSub ──spawn──> ffmpeg/ffprobe （字幕探测与导出）
 
 | 平台 | 产物 | 外部程序 |
 |---|---|---|
-| Windows | `.msi` / `-setup.exe`（NSIS，免管理员） | **已内置 mpv + ffmpeg，开箱即用** |
-| macOS Apple Silicon | `aarch64.dmg` | 已内置 ffmpeg；mpv 需 `brew install mpv` |
+| Windows | `.msi` / `-setup.exe`（NSIS，免管理员） | **已内置 libmpv + ffmpeg，开箱即用** |
+| macOS Apple Silicon | `aarch64.dmg` | 已内置 ffmpeg；libmpv 需 `brew install mpv` |
 | macOS Intel | `x64.dmg` | 同上 |
 
 - macOS 未签名公证：首次运行右键 → 打开；内置的 ffmpeg 为 x86_64 构建，Apple Silicon 首次调用需 Rosetta 2（系统会自动引导安装一次）。
@@ -71,7 +71,7 @@ loopSub ──spawn──> ffmpeg/ffprobe （字幕探测与导出）
 
 ## 快速上手
 
-1. 启动 loopSub（自动拉起缴械版 mpv 作背景）
+1. 启动 loopSub（自动启动缴械的 libmpv 实例作背景）
 2. 点 📂 打开视频（或拖入窗口 / 从「最近播放」下拉选取）：自动探测内嵌字幕并从上次位置续播，无字幕时点提示条「去搜索」
 3. 字幕就绪后：↑↓ 逐句走，`Enter` 单句循环跟读，`[` `]` 框区间反复听
 4. 点「翻译」后台滚动预翻，`T` 切换译文显隐；`V` 选中当前句，`Ctrl+C` 复制英文去大模型追问
@@ -96,7 +96,11 @@ loopSub ──spawn──> ffmpeg/ffprobe （字幕探测与导出）
 
 ## 从源码运行
 
-依赖：Rust ≥ 1.77、系统 mpv + ffmpeg（`sudo apt install mpv ffmpeg`）、Tauri 系统依赖（Linux: `webkit2gtk-4.1` 等，见 [Tauri 文档](https://v2.tauri.app/start/prerequisites/)）。
+依赖：Rust ≥ 1.77、libmpv 与 ffmpeg、Tauri 系统依赖（Linux: `webkit2gtk-4.1` 等，见 [Tauri 文档](https://v2.tauri.app/start/prerequisites/)）。
+
+- **Windows**：从 [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake/releases) 下载 `mpv-dev` 包，将其中的 `libmpv-2.dll` 与 ffmpeg/ffprobe（gyan.dev 静态构建）放到 `src-tauri/target/debug/`（或运行后在设置页指定目录）
+- **Debian/Ubuntu**：`sudo apt install libmpv2 ffmpeg`
+- **macOS**：`brew install mpv ffmpeg`
 
 ```bash
 cargo run --manifest-path src-tauri/Cargo.toml   # 开发运行（无 node 步骤）
@@ -111,7 +115,7 @@ CI 自动出包（`.github/workflows/release.yml`，三平台矩阵：Windows / 
 git tag v0.1.0 && git push origin v0.1.0   # 或在 Actions 页手动触发
 ```
 
-CI 构建前自动下载 mpv（sourceforge 最新版）与 ffmpeg（gyan.dev / evermeet 静态构建）注入安装包，产物汇总为草稿 Release。本地打包需 `cargo install tauri-cli` 后 `cargo tauri build`。
+CI 构建前自动下载 libmpv（shinchiro mpv-dev 包）与 ffmpeg（gyan.dev / evermeet 静态构建）注入安装包，产物汇总为草稿 Release。本地打包需 `cargo install tauri-cli` 后 `cargo tauri build`。
 
 ## 项目结构
 
@@ -122,7 +126,7 @@ CI 构建前自动下载 mpv（sourceforge 最新版）与 ffmpeg（gyan.dev / e
 │   └── settings.js          # 设置页（8 分区 + 25 键位改绑）
 ├── src-tauri/src/
 │   ├── lib.rs               # Tauri 命令装配与应用状态
-│   ├── mpv/                 # mpv JSON IPC 客户端（Unix socket / 命名管道）
+│   ├── mpv/                 # libmpv dlopen C API（embed）+ 自建视频窗口（vidwin）+ IPC（手动连接外部 mpv）
 │   ├── media/               # ffprobe/ffmpeg 字幕探测与导出
 │   ├── subtitle/            # SRT 解析、句子表、大写还原
 │   ├── opensub/             # OpenSubtitles（moviehash + 搜索 + 下载）
@@ -137,7 +141,7 @@ CI 构建前自动下载 mpv（sourceforge 最新版）与 ffmpeg（gyan.dev / e
 
 ## 文档与路线
 
-详细设计决策（焦点模型、翻译管线策略、字幕同步问题分析）见 [DESIGN.md](DESIGN.md)。已完成 v1（播放闭环）与 v1.5（搜索 + 翻译）；v2 规划：悬浮字幕条、ffsubsync 同步修复、Anki 导出、libmpv 内嵌、翻译并发与断点续翻。
+详细设计决策（焦点模型、翻译管线策略、字幕同步问题分析）见 [DESIGN.md](DESIGN.md)。已完成 v1（播放闭环）、v1.5（搜索 + 翻译）与 v2（悬浮字幕条、ffsubsync 同步修复、Anki 导出、libmpv 进程内嵌入）；后续规划：翻译并发与断点续翻。
 
 ## License
 

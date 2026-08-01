@@ -158,9 +158,13 @@ async fn mpv_start_internal(state: &AppState) -> Result<(), String> {
             e.shutdown();
         }
     }
-    let dll = mpv::embed::resolve_dll(state.settings.lock().unwrap().bins.dir.clone())
-        .ok_or("未找到 libmpv 动态库（libmpv-2.dll）：可放至程序目录，或在设置页指定外部程序目录")?;
-    let api = mpv::embed::MpvApi::load(&dll)?;
+        // 设置目录/exe 目录找不到时，裸名走系统动态库搜索路径兜底
+    // （Linux 发行版仓库、macOS Homebrew 安装的 libmpv）
+    let api = match mpv::embed::resolve_dll(state.settings.lock().unwrap().bins.dir.clone()) {
+        Some(dll) => mpv::embed::MpvApi::load(&dll)?,
+        None => mpv::embed::MpvApi::load(std::path::Path::new(mpv::embed::system_dll_name()))
+            .map_err(|e| format!("未找到 libmpv 动态库：可放至程序目录、系统安装，或在设置页指定外部程序目录（{e}）"))?,
+    };
     let embed = mpv::embed::MpvEmbed::new(api)?;
     let m = Mpv::Embed(embed);
 

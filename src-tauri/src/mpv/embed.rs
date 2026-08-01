@@ -438,3 +438,14 @@ pub fn resolve_dll(settings_dir: Option<PathBuf>) -> Option<PathBuf> {
         .flat_map(|d| NAMES.iter().map(move |n| d.join(n)))
         .find(|p| p.is_file())
 }
+
+/// 系统安装的 libmpv 裸名（Linux 发行版仓库、macOS Homebrew）：
+/// 走系统动态库搜索路径，作为 resolve_dll 找不到文件时的兜底
+pub fn system_dll_name() -> &'static str {
+    #[cfg(windows)]
+    return "libmpv-2.dll";
+    #[cfg(target_os = "macos")]
+    return "libmpv.dylib";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    return "libmpv.so.2";
+}

@@ -45,8 +45,9 @@ jobs:
           workspaces: src-tauri
 
       # ---- 随包携带外部程序（下载到 src-tauri/resources/，bundle.resources 释放） ----
-      # Windows：mpv（sourceforge RSS 动态发现最新版，exe+dll 文件夹）+ ffmpeg/ffprobe（gyan.dev 静态单 exe）
-      - name: Bundle mpv & ffmpeg (Windows)
+      # Windows：libmpv-2.dll（shinchiro mpv-dev 包，GitHub releases 动态发现最新版）
+      #         + ffmpeg/ffprobe（gyan.dev 静态单 exe）
+      - name: Bundle libmpv & ffmpeg (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
@@ -56,20 +57,19 @@ jobs:
           7z x ffmpeg.zip
           Copy-Item "ffmpeg-*-essentials_build\bin\ffmpeg.exe" src-tauri\resources\
           Copy-Item "ffmpeg-*-essentials_build\bin\ffprobe.exe" src-tauri\resources\
-          # mpv：RSS 按时间倒序，第一条即最新
-          $rss = (Invoke-WebRequest "https://sourceforge.net/projects/mpv-player-windows/rss?path=/64bit").Content
-          $name = [regex]::Match($rss, 'mpv-x86_64-\d+-git-[0-9a-f]+\.7z').Value
-          if (-not $name) { throw "未能从 sourceforge RSS 解析 mpv 最新版本" }
-          Write-Host "mpv: $name"
-          Invoke-WebRequest "https://sourceforge.net/projects/mpv-player-windows/files/64bit/$name/download" -OutFile mpv.7z
-          7z x mpv.7z -ompv_pkg
-          $inner = Get-ChildItem mpv_pkg
-          $src = if ($inner.Count -eq 1 -and $inner[0].PSIsContainer) { $inner[0].FullName } else { 'mpv_pkg' }
-          New-Item -ItemType Directory -Force src-tauri\resources\mpv | Out-Null
-          Copy-Item "$src\*" src-tauri\resources\mpv -Recurse
+          # libmpv：mpv-dev 开发包（含 libmpv-2.dll，进程内嵌入）
+          $rel = Invoke-RestMethod "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
+          $asset = $rel.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-\d+-git-[0-9a-f]+\.7z$' } | Select-Object -First 1
+          if (-not $asset) { throw "未在 shinchiro/mpv-winbuild-cmake 最新 release 找到 mpv-dev 资产" }
+          Write-Host "libmpv: $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile mpv-dev.7z
+          7z x mpv-dev.7z -ompv_dev
+          $dll = Get-ChildItem mpv_dev -Recurse -Filter libmpv-2.dll | Select-Object -First 1
+          if (-not $dll) { throw "mpv-dev 包内未找到 libmpv-2.dll" }
+          Copy-Item $dll.FullName src-tauri\resources\
 
       # macOS：ffmpeg/ffprobe（evermeet 静态构建，x86_64；ARM Mac 经 Rosetta 2 运行）。
-      # mpv 无可靠 macOS 静态构建源，仍需用户 brew install mpv。
+      # libmpv 无可靠 macOS 静态构建源，需用户 brew install mpv（dylib 走系统搜索路径加载）。
       - name: Bundle ffmpeg (macOS)
         if: startsWith(matrix.os, 'macos')
         run: |
@@ -91,8 +91,8 @@ jobs:
           releaseName: "loopSub ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
           releaseBody: |
             ## 安装
-            - **Windows**：`.msi` 或 `-setup.exe`（NSIS，当前用户安装，无需管理员），已内置 mpv 与 ffmpeg，开箱即用
-            - **macOS**：`.dmg`（Apple Silicon 用 aarch64，Intel 用 x64），已内置 ffmpeg；**mpv 需自行安装**：`brew install mpv`
+            - **Windows**：`.msi` 或 `-setup.exe`（NSIS，当前用户安装，无需管理员），已内置 libmpv 与 ffmpeg，开箱即用
+            - **macOS**：`.dmg`（Apple Silicon 用 aarch64，Intel 用 x64），已内置 ffmpeg；**libmpv 需自行安装**：`brew install mpv`
 
             ## 外部依赖
             未随包携带的程序可在 loopSub 设置页「外部程序」中指定所在目录，或加入 PATH。
@@ -100,6 +100,6 @@ jobs:
           prerelease: false
           args: --target ${{ matrix.target }}
 
-# TODO（后续迭代）：macOS 的 mpv 随包携带
+# TODO（后续迭代）：macOS 的 libmpv 随包携带
 #   无可靠静态构建源（stolendata 已不可用）；可选方案：CI 里 brew install mpv 后
 #   用 dylibbundler 收集依赖 dylib 一并打进 .app，或引导用户 brew install mpv（现状）。
