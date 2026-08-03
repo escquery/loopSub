@@ -58,16 +58,9 @@ button:hover { border-color: var(--accent); }
 #history-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #history-arrow { color: var(--fg-dim); }
 #history-list {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  right: 0;
-  max-height: 260px;
+  flex: 1;
   overflow-y: auto;
-  background: var(--bg-alt);
-  border: 1px solid #3a3d44;
-  border-radius: 4px;
-  z-index: 30;
+  padding: 6px;
 }
 .history-item { padding: 6px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .history-item:hover { background: var(--current); }
@@ -155,7 +148,7 @@ body.no-zh .zh { display: none; }
 }
 #notice-bar button { margin-left: 8px; padding: 1px 8px; font-size: 12px; }
 
-#search-panel, #settings-drawer {
+#search-panel, #settings-drawer, #history-panel {
   position: absolute;
   top: 40px;
   left: 0;
@@ -292,15 +285,12 @@ body.single #drawer {
 }
 body.single #drawer #sentence-list { flex: 1; }
 body.single #drawer #mini-bar { flex: none; }
-/* 全铺面板（搜索/设置）在抽屉内相对抽屉定位（原 top:40 是相对面板小窗） */
+/* 全铺面板（搜索/历史/设置）在抽屉内相对抽屉定位（原 top:40 是相对面板小窗） */
 body.single #search-panel,
-body.single #settings-drawer { top: 0; }
-/* 通知条浮在视频区上 */
+body.single #settings-drawer,
+body.single #history-panel { top: 0; }
+/* 通知条收进抽屉顶部（浮在视频区会被 mpv 渲染层盖住；加载进度另有 OSD 同步） */
 body.single #notice-bar {
-  position: fixed;
-  top: 50px;
-  left: 10px;
-  z-index: 60;
-  border-radius: 4px;
-  max-width: 70%;
+  position: static;
+  max-width: none;
 }

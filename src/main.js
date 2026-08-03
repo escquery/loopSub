@@ -57,6 +57,8 @@ function showNotice(html) {
   }
   bar.innerHTML = html;
   bar.classList.remove('hidden');
+  // 单窗口形态下通知条收在抽屉里（关上时不可见），视频上同步一份 OSD 纯文本
+  if (singleMode) osd(bar.textContent.trim());
 }
 
 // ---------- 视频 / 字幕加载 ----------
@@ -130,22 +132,18 @@ async function refreshHistory() {
     .join('');
 }
 
-$('#history-box').addEventListener('click', (e) => {
-  if (e.target.closest('.history-item')) return; // 条目点击由下面代理处理
-  $('#history-list').classList.toggle('hidden');
+// 历史记录为全铺面板（同搜索面板）：下拉浮层在单窗口形态会被 mpv 渲染层盖住
+$('#history-box').addEventListener('click', () => {
+  $('#history-panel').classList.toggle('hidden');
 });
+$('#btn-history-close').addEventListener('click', () => $('#history-panel').classList.add('hidden'));
 
 $('#history-list').addEventListener('click', (e) => {
   const item = e.target.closest('.history-item');
   if (!item) return;
-  $('#history-list').classList.add('hidden');
+  $('#history-panel').classList.add('hidden');
   const p = item.dataset.path;
   if (p && p !== state.videoPath) loadVideo(p);
-});
-
-// 点击下拉外任意处收起
-document.addEventListener('click', (e) => {
-  if (!e.target.closest('#history-box')) $('#history-list').classList.add('hidden');
 });
 
 // 拖入视频文件即加载（Tauri 默认拦截文件拖放并转发为 tauri://drag-drop 事件）
@@ -678,9 +676,10 @@ async function initWindowMode() {
   } catch { return; }
   if (!singleMode) return;
   document.body.classList.add('single');
-  // 面板元素搬入右侧抽屉（事件绑在元素上，搬移后保留）
+  // 面板元素搬入右侧抽屉（事件绑在元素上，搬移后保留）；通知条进抽屉顶部
   const drawer = $('#drawer');
-  for (const sel of ['#status-badges', '#trans-bar', '#advanced', '#sentence-list', '#mini-bar', '#search-panel', '#settings-drawer']) {
+  drawer.appendChild($('#notice-bar'));
+  for (const sel of ['#status-badges', '#trans-bar', '#advanced', '#sentence-list', '#mini-bar', '#search-panel', '#history-panel', '#settings-drawer']) {
     drawer.appendChild($(sel));
   }
   // 播放控制提上顶栏（从 mini-bar 中提出，插到时间显示前）
@@ -689,6 +688,11 @@ async function initWindowMode() {
   const bp = $('#btn-panel');
   bp.classList.remove('hidden');
   bp.addEventListener('click', toggleDrawer);
+  // 搜索/设置/历史的面板都在抽屉里：抽屉关着时点这些入口先自动开抽屉
+  //（捕获阶段先执行，原处理逻辑照常走）
+  for (const sel of ['#history-box', '#btn-open-search', '#btn-settings']) {
+    $(sel).addEventListener('click', () => { if (!drawerOpen) toggleDrawer(); }, true);
+  }
   // 通知 Rust 侧 webview 已就绪：抬升并重排 mpv 子窗口
   invoke('webview_ready').catch(() => {});
 }

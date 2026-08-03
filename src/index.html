@@ -12,7 +12,6 @@
     <div id="history-box">
       <span id="history-label">暂无播放记录</span>
       <span id="history-arrow">▾</span>
-      <div id="history-list" class="hidden"></div>
     </div>
     <button id="btn-open-search" title="搜索字幕">🔍</button>
     <button id="btn-settings" title="设置">⚙</button>
@@ -29,6 +28,14 @@
       <button id="btn-search-close" title="关闭">×</button>
     </div>
     <div id="search-results"><span class="dim">尚未搜索</span></div>
+  </div>
+
+  <div id="history-panel" class="hidden">
+    <div class="panel-head">
+      <span class="panel-title">最近播放</span>
+      <button id="btn-history-close" title="关闭">×</button>
+    </div>
+    <div id="history-list"></div>
   </div>
 
   <div id="trans-bar" class="hidden">
