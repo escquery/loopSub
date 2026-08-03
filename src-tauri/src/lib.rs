@@ -11,7 +11,6 @@ pub mod subtitle;
 pub mod sync;
 pub mod translate;
 mod bins;
-mod winctl;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -26,6 +25,79 @@ pub struct AppState {
     mpv: tokio::sync::Mutex<Option<Mpv>>,
     /// 当前加载视频的 hash（播放位置按它存；后端持有，避开 JS f64 存不下 u64 的精度问题）
     current_video: Mutex<Option<u64>>,
+    /// 学习面板抽屉开合（Phase C 单窗口；视频区随它收窄/恢复）
+    drawer_open: Mutex<bool>,
+}
+
+/// 单窗口布局常量（Phase C，Windows）：顶栏高 / 抽屉宽（逻辑像素）
+#[cfg(windows)]
+const BAR_H: f64 = 44.0;
+#[cfg(windows)]
+const DRAWER_W: f64 = 420.0;
+
+/// 重排视频子窗口：顶栏以下、抽屉以左的区域（顺带抬顶——WebView2 异步初始化
+/// 会把自己的子窗口压在 mpv 子窗口上面）。非嵌入形态（降级/顶层窗口）无操作。
+#[cfg(windows)]
+fn relayout_video(app: &tauri::AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    let state = app.state::<AppState>();
+    let Ok(scale) = win.scale_factor() else { return };
+    let Ok(size) = win.inner_size() else { return };
+    let bar_h = (BAR_H * scale).round() as i32;
+    let drawer_w = if *state.drawer_open.lock().unwrap() {
+        (DRAWER_W * scale).round() as i32
+    } else {
+        0
+    };
+    let (w, h) = (size.width as i32, size.height as i32);
+    // 本函数在主线程执行（Resized/命令投递）：绝不阻塞等 mpv 锁——持锁方
+    // （mpv_start_internal 创建子窗口）可能正在等主线程，blocking 会成死锁环；
+    // 拿不到就跳过，下次 Resized/ready/drawer 再排。
+    let Ok(guard) = state.mpv.try_lock() else { return };
+    if let Some(Mpv::Embed(e)) = guard.as_ref() {
+        e.with_vidwin(|vw| {
+            vw.set_rect(0, bar_h, (w - drawer_w).max(1), (h - bar_h).max(1));
+            vw.raise();
+        });
+    }
+}
+
+/// 前端形态：Windows = 单窗口（顶栏+抽屉+内嵌视频）；其余平台 = 面板+独立视频窗
+#[tauri::command]
+fn window_mode() -> &'static str {
+    #[cfg(windows)]
+    return "single";
+    #[cfg(not(windows))]
+    return "panel";
+}
+
+/// 抽屉开合：记录状态并重排视频区
+#[tauri::command]
+fn set_drawer(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    open: bool,
+) -> Result<(), String> {
+    *state.drawer_open.lock().unwrap() = open;
+    #[cfg(windows)]
+    {
+        // 重排要做 SetWindowPos，必须在子窗口所属的主线程执行（command 跑在工作线程）
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || relayout_video(&app2));
+    }
+    Ok(())
+}
+
+/// 前端就绪（DOMContentLoaded）：WebView2 初始化完成后抬顶+重排视频子窗口
+#[tauri::command]
+fn webview_ready(app: tauri::AppHandle) {
+    #[cfg(windows)]
+    {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || relayout_video(&app2));
+    }
 }
 
 impl AppState {
@@ -146,8 +218,9 @@ fn load_srt(state: tauri::State<'_, AppState>, path: String) -> Result<Vec<subti
 
 // ---------- mpv 生命周期 ----------
 
-/// 拉起 mpv（libmpv 进程内实例；已存活则复用，已退出则重建），并应用音频设置
-async fn mpv_start_internal(state: &AppState) -> Result<(), String> {
+/// 拉起 mpv（libmpv 进程内实例；已存活则复用，已退出则重建），并应用音频设置。
+/// Windows 单窗口形态：视频子窗口嵌入主窗口顶栏以下区域。
+async fn mpv_start_internal(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
     let mut guard = state.mpv.lock().await;
     if let Some(m) = guard.as_ref() {
         if !m.is_dead() {
@@ -165,7 +238,31 @@ async fn mpv_start_internal(state: &AppState) -> Result<(), String> {
         None => mpv::embed::MpvApi::load(std::path::Path::new(mpv::embed::system_dll_name()))
             .map_err(|e| format!("未找到 libmpv 动态库：可放至程序目录、系统安装，或在设置页指定外部程序目录（{e}）"))?,
     };
-    let embed = mpv::embed::MpvEmbed::new(api)?;
+
+    // Windows：子窗口嵌入主窗口（Phase C 单窗口）；其余平台：mpv 自建顶层窗口
+    #[cfg(windows)]
+    let layout = {
+        let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
+        let scale = win.scale_factor().map_err(|e| e.to_string())?;
+        let size = win.inner_size().map_err(|e| e.to_string())?;
+        let bar_h = (BAR_H * scale).round() as i32;
+        let drawer_w = if *state.drawer_open.lock().unwrap() {
+            (DRAWER_W * scale).round() as i32
+        } else {
+            0
+        };
+        Some(mpv::embed::VidLayout {
+            parent: win.hwnd().map_err(|e| e.to_string())?.0 as usize,
+            x: 0,
+            y: bar_h,
+            w: (size.width as i32 - drawer_w).max(1),
+            h: (size.height as i32 - bar_h).max(1),
+        })
+    };
+    #[cfg(not(windows))]
+    let layout = None;
+
+    let embed = mpv::embed::MpvEmbed::new(api, layout, app)?;
     let m = Mpv::Embed(embed);
 
     let audio = state.audio();
@@ -177,18 +274,31 @@ async fn mpv_start_internal(state: &AppState) -> Result<(), String> {
     }
 
     *guard = Some(m);
+    // 新建视频子窗口后抬顶+落位：WebView2 的渲染层会压在子窗口上面
+    //（实测创建后黑屏，raise 一次才显示）。异步投递，闭包执行时本函数已还锁。
+    #[cfg(windows)]
+    {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || relayout_video(&app2));
+    }
     Ok(())
 }
 
 #[tauri::command]
-async fn mpv_start(state: tauri::State<'_, AppState>, video_path: Option<String>) -> Result<String, String> {
-    mpv_start_internal(&state).await?;
+async fn mpv_start(app: tauri::AppHandle, state: tauri::State<'_, AppState>, video_path: Option<String>) -> Result<String, String> {
+    mpv_start_internal(&state, &app).await?;
     if let Some(vp) = video_path {
         let guard = state.mpv.lock().await;
         let ipc = guard.as_ref().unwrap();
         ipc.command(vec!["loadfile".into(), vp.into()])
             .await
             .map_err(|e| e.to_string())?;
+    }
+    // 同 load_video：锁释放后抬顶+落位视频子窗口
+    #[cfg(windows)]
+    {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || relayout_video(&app2));
     }
     Ok("ok".into())
 }
@@ -292,7 +402,7 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
 
     // 拉起 mpv 并播放（无字幕也先播，等用户搜索）；面板渲染模式下关掉 mpv 自带字幕
     let _ = app.emit("video-load-progress", "正在启动播放器…");
-    mpv_start_internal(&state).await?;
+    mpv_start_internal(&state, &app).await?;
     {
         let guard = state.mpv.lock().await;
         let ipc = guard.as_ref().unwrap();
@@ -312,6 +422,13 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
         if state.panel_render() {
             let _ = ipc.set_property("sub-visibility", false.into()).await;
         }
+    }
+
+    // 锁已释放：抬顶+落位视频子窗口（mpv_start_internal 的投递可能撞锁被跳过）
+    #[cfg(windows)]
+    {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || relayout_video(&app2));
     }
 
     // 成功加载后写入历史记录（MRU 置顶）
@@ -508,18 +625,20 @@ fn get_translation(
 
 // ---------- 窗口行为 ----------
 
-/// 召回 mpv 窗口：提升到普通窗口层顶部（面板 always-on-top 仍在它上面）
+/// 召回主窗口（单窗口形态 = 视频窗口本体）：还原最小化并聚焦。
+/// 手动 IPC 连接外部 mpv 的模式下无意义。
 #[tauri::command]
-async fn recall_mpv(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let guard = state.mpv.lock().await;
-    match guard.as_ref() {
-        Some(Mpv::Embed(e)) => match e.hwnd() {
-            Some(hwnd) => winctl::raise_window(hwnd),
-            // 降级路径（自建窗口失败）：按类名枚举找 mpv 自建窗口
-            None => winctl::recall_mpv_window(),
-        },
-        _ => Err("mpv 未在播放（手动连接模式不支持召回）".into()),
+async fn recall_mpv(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if matches!(state.mpv.lock().await.as_ref(), Some(Mpv::Ipc(_)) | None) {
+        return Err("mpv 未在播放（手动连接模式不支持召回）".into());
     }
+    let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
+    let _ = win.unminimize();
+    let _ = win.show();
+    win.set_focus().map_err(|e| e.to_string())
 }
 
 // ---------- 字幕自动对齐 ----------
@@ -743,52 +862,6 @@ async fn export_anki_note(
     }
 }
 
-/// 悬浮字幕条开关：透明/无边框/置顶/不抢焦点的小窗，浮在视频画面上。
-/// 位置取设置记忆值，缺省为主屏底部居中（约 78% 高度处）。
-#[tauri::command]
-async fn toggle_float_bar(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    enabled: bool,
-) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window("floatbar") {
-        let r = if enabled { w.show() } else { w.close() };
-        return r.map_err(|e| e.to_string());
-    }
-    if !enabled {
-        return Ok(()); // 未创建且要求关闭：无操作
-    }
-    let main = app.get_webview_window("main").ok_or("主窗口不存在")?;
-    let monitor = main
-        .current_monitor()
-        .map_err(|e| e.to_string())?
-        .ok_or("无法获取显示器信息")?;
-    let screen = monitor.size();
-    let (w, h) = (760.0_f64, 150.0_f64);
-    let pos = state.settings.lock().unwrap().window.float_bar_pos;
-    let (x, y) = match pos {
-        Some((x, y)) => (x as f64, y as f64),
-        None => (
-            (screen.width as f64 - w) / 2.0,
-            screen.height as f64 * 0.78,
-        ),
-    };
-    tauri::WebviewWindowBuilder::new(&app, "floatbar", tauri::WebviewUrl::App("floatbar.html".into()))
-        .title("loopSub 字幕条")
-        .transparent(true)
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focusable(false)
-        .shadow(false)
-        .resizable(false)
-        .inner_size(w, h)
-        .position(x, y)
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 #[tauri::command]
 fn set_always_on_top(window: tauri::Window, flag: bool) -> Result<(), String> {
     window.set_always_on_top(flag).map_err(|e| e.to_string())
@@ -835,13 +908,24 @@ pub fn run() {
             if let Some(main_win) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
                 main_win.on_window_event(move |event| {
-                    if matches!(event, tauri::WindowEvent::Destroyed) {
-                        eprintln!("[win-event] main destroyed, shutdown mpv");
-                        let state = app_handle.state::<AppState>();
-                        let taken = state.mpv.blocking_lock().take();
-                        if let Some(Mpv::Embed(e)) = taken {
-                            e.shutdown();
+                    match event {
+                        tauri::WindowEvent::Destroyed => {
+                            eprintln!("[win-event] main destroyed, shutdown mpv");
+                            let state = app_handle.state::<AppState>();
+                            // 退出路径不阻塞等锁：持锁方（mpv_start_internal）可能正在
+                            // 等主线程创建子窗口，此处 blocking 会成死锁环退不掉；
+                            // 拿不到就随进程退出（进程内 libmpv 由 OS 兜底清理）
+                            let g = state.mpv.try_lock();
+                            if let Ok(mut g) = g {
+                                if let Some(Mpv::Embed(e)) = g.take() {
+                                    e.shutdown();
+                                }
+                            }
                         }
+                        // 拉伸重排视频子窗口（顶栏以下、抽屉以左）
+                        #[cfg(windows)]
+                        tauri::WindowEvent::Resized(_) => relayout_video(&app_handle),
+                        _ => {}
                     }
                 });
             }
@@ -852,6 +936,7 @@ pub fn run() {
             settings_path,
             mpv: tokio::sync::Mutex::new(None),
             current_video: Mutex::new(None),
+            drawer_open: Mutex::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
@@ -869,13 +954,15 @@ pub fn run() {
             recall_mpv,
             set_always_on_top,
             pick_video,
-            toggle_float_bar,
             auto_sync_subtitles,
             save_sync_offset,
             get_sync_offset,
             get_history,
             save_playback_position,
             export_anki_note,
+            window_mode,
+            set_drawer,
+            webview_ready,
         ])
         .build(tauri::generate_context!())
         .expect("error while building loopSub");
@@ -884,9 +971,12 @@ pub fn run() {
     app.run(|handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
             let state = handle.state::<AppState>();
-            let taken = state.mpv.blocking_lock().take();
-            if let Some(Mpv::Embed(e)) = taken {
-                e.shutdown();
+            // 同 Destroyed：try_lock，拿不到就由 OS 回收（下一行 process::exit 反正强退）
+            let g = state.mpv.try_lock();
+            if let Ok(mut g) = g {
+                if let Some(Mpv::Embed(e)) = g.take() {
+                    e.shutdown();
+                }
             }
             eprintln!("[run-event] exit cleanup done, process::exit");
             // libmpv/WebView2/CRT 多层运行时的退出收尾在 Windows 上会互相等锁

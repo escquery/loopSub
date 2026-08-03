@@ -262,84 +262,45 @@ body.mini #search-panel { display: none; }
   border-top: 1px solid #3a3d44;
 }
 
-/* ---------- 悬浮字幕条（floatbar.html，透明置顶窗） ---------- */
-body.floatbar {
-  margin: 0;
-  overflow: hidden;
-  background: transparent;
-  font-family: system-ui, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-  user-select: none;
+/* ---------- 单窗口模式（Windows：mpv 画面内嵌主窗口，学习面板收进右侧抽屉） ---------- */
+body.single #top-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 44px;
+  z-index: 50;
+  border-bottom: 1px solid #3a3d44;
 }
-body.floatbar #bar {
-  position: absolute;
-  inset: 0;
+/* 播放控制提上顶栏后靠右，给历史记录下拉留出弹性空间 */
+body.single #top-bar #transport { margin-left: auto; }
+body.single #pos-time {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+body.single #drawer {
+  position: fixed;
+  top: 44px;
+  right: 0;
+  bottom: 0;
+  width: 420px;
+  z-index: 40;
   display: flex;
   flex-direction: column;
-  justify-content: flex-end; /* 字幕贴窗口底部，控件向上展开 */
-  align-items: center;
-  padding-bottom: 6px;
+  background: var(--bg);
+  border-left: 1px solid #3a3d44;
 }
-/* 字幕行：无背景，文字描边阴影保证任何画面上可读 */
-body.floatbar .sub-line {
-  max-width: 100%;
-  padding: 0 12px;
-  text-align: center;
-  color: #fff;
-  font-size: 22px;
-  line-height: 1.35;
-  text-shadow: 0 1px 3px #000, 0 0 6px rgba(0, 0, 0, 0.9), 1px 1px 0 #000, -1px 1px 0 #000;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+body.single #drawer #sentence-list { flex: 1; }
+body.single #drawer #mini-bar { flex: none; }
+/* 全铺面板（搜索/设置）在抽屉内相对抽屉定位（原 top:40 是相对面板小窗） */
+body.single #search-panel,
+body.single #settings-drawer { top: 0; }
+/* 通知条浮在视频区上 */
+body.single #notice-bar {
+  position: fixed;
+  top: 50px;
+  left: 10px;
+  z-index: 60;
+  border-radius: 4px;
+  max-width: 70%;
 }
-body.floatbar .sub-line.zh { font-size: 19px; color: #ffe9a8; }
-body.floatbar .sub-line.hidden { display: none; }
-
-/* 展开态：半透明底 + 控件排 + 拖拽条显现 */
-body.floatbar #drag-handle {
-  position: absolute;
-  top: 0;
-  left: 15%;
-  right: 15%;
-  height: 12px;
-  border-radius: 0 0 8px 8px;
-  background: rgba(20, 22, 26, 0.75);
-  cursor: move;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-body.floatbar #controls {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-  padding: 6px 10px;
-  margin-bottom: 6px;
-  border-radius: 10px;
-  background: rgba(20, 22, 26, 0.75);
-  opacity: 0;
-  transform: translateY(4px);
-  transition: opacity 0.15s, transform 0.15s;
-  pointer-events: none;
-}
-body.floatbar #bar.expanded #controls {
-  opacity: 1;
-  transform: none;
-  pointer-events: auto;
-}
-body.floatbar #bar.expanded #drag-handle { opacity: 1; }
-body.floatbar #controls button {
-  background: #2a2d33;
-  color: #e8e8e8;
-  border: 1px solid #3a3d44;
-  border-radius: 6px;
-  padding: 3px 9px;
-  font-size: 14px;
-  cursor: pointer;
-}
-body.floatbar #controls button:hover { border-color: var(--accent, #4f9cf9); }
-body.floatbar #controls button.active {
-  background: var(--accent, #4f9cf9);
-  border-color: var(--accent, #4f9cf9);
-  color: #fff;
-}
-body.floatbar #controls .sep { width: 1px; height: 18px; background: #3a3d44; }

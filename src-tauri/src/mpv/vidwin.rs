@@ -21,6 +21,8 @@ struct Shared {
     destroyed: AtomicBool,
     /// 用户点 X 时回调（向 mpv 投递 quit），由 MpvEmbed 注入
     on_close: Box<dyn Fn() + Send + Sync>,
+    /// 鼠标命中穿透（子窗口嵌入形态）：视频层纯显示，输入全归下层 WebView2
+    input_passthrough: bool,
 }
 
 pub struct VideoWindow {
@@ -44,6 +46,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DestroyWindow(hwnd);
             0
         }
+        WM_NCHITTEST => {
+            let shared = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shared;
+            if !shared.is_null() && (*shared).input_passthrough {
+                // 穿透到下层兄弟（WebView2）：按键/点击/滚轮全归 UI 层
+                return HTTRANSPARENT as LRESULT;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_DESTROY => {
             let shared = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shared;
             if !shared.is_null() {
@@ -59,7 +69,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
-unsafe fn create_window() -> Result<HWND, String> {
+struct WinCfg {
+    parent: usize, // HWND 转 usize 以跨线程传递（裸指针非 Send）
+    style: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    title: &'static str,
+}
+
+unsafe fn create_window(cfg: &WinCfg) -> Result<HWND, String> {
     let hinstance = GetModuleHandleW(std::ptr::null());
     let class: Vec<u16> = CLASS_NAME
         .encode_utf16()
@@ -77,17 +97,17 @@ unsafe fn create_window() -> Result<HWND, String> {
     // 重建实例时类已注册，返回 0 属正常，忽略
     RegisterClassW(&wc);
 
-    let title: Vec<u16> = "loopSub".encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = cfg.title.encode_utf16().chain(std::iter::once(0)).collect();
     let hwnd = CreateWindowExW(
         0,
         class.as_ptr(),
         title.as_ptr(),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        1280,
-        720,
-        std::ptr::null_mut(),
+        cfg.style,
+        cfg.x,
+        cfg.y,
+        cfg.w,
+        cfg.h,
+        cfg.parent as HWND,
         std::ptr::null_mut(),
         hinstance,
         std::ptr::null(),
@@ -100,16 +120,20 @@ unsafe fn create_window() -> Result<HWND, String> {
 }
 
 impl VideoWindow {
-    /// 在专用线程创建窗口并跑消息泵；HWND（转 usize）经 channel 传回
-    pub fn create(on_close: impl Fn() + Send + Sync + 'static) -> Result<Self, String> {
+    fn spawn(
+        cfg: WinCfg,
+        input_passthrough: bool,
+        on_close: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<Result<usize, String>>();
         let shared = Arc::new(Shared {
             destroyed: AtomicBool::new(false),
             on_close: Box::new(on_close),
+            input_passthrough,
         });
         let shared2 = shared.clone();
         let thread = std::thread::spawn(move || {
-            match unsafe { create_window() } {
+            match unsafe { create_window(&cfg) } {
                 Ok(hwnd) => {
                     let _ = tx.send(Ok(hwnd as usize));
                     // Shared 挂到窗口上（into_raw 的引用在 WM_DESTROY 归还）
@@ -136,6 +160,85 @@ impl VideoWindow {
             shared,
             thread: Some(thread),
         })
+    }
+
+    /// 在专用线程创建顶层窗口并跑消息泵；HWND（转 usize）经 channel 传回
+    pub fn create(on_close: impl Fn() + Send + Sync + 'static) -> Result<Self, String> {
+        Self::spawn(
+            WinCfg {
+                parent: 0,
+                style: WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                x: CW_USEDEFAULT as i32,
+                y: 0,
+                w: 1280,
+                h: 720,
+                title: "loopSub",
+            },
+            false,
+            on_close,
+        )
+    }
+
+    /// 子窗口形态（Phase C 叠层单窗口）：在**调用线程**创建——调用方必须保证
+    /// 这是主线程（embed 经 run_on_main_thread 投递；Tauri 主线程 event loop
+    /// 顺带 Dispatch 子窗口消息）。
+    /// 为何不开专用线程：命中穿透（HTTRANSPARENT）与 SetWindowPos 重排都只在
+    /// 同线程窗口间可靠工作；跨线程实测死锁（主窗口 Responding=False）。
+    /// 输入穿透——视频层纯显示，鼠标/键盘全归下层的 WebView2 UI。
+    pub fn create_child(parent: HWND, x: i32, y: i32, w: i32, h: i32) -> Result<Self, String> {
+        let shared = Arc::new(Shared {
+            destroyed: AtomicBool::new(false),
+            on_close: Box::new(|| {}), // 子窗口无关闭按钮，不会触发
+            input_passthrough: true,
+        });
+        let hwnd = unsafe {
+            create_window(&WinCfg {
+                parent: parent as usize,
+                style: WS_CHILD | WS_VISIBLE,
+                x,
+                y,
+                w,
+                h,
+                title: "",
+            })
+        }?;
+        let raw = Arc::into_raw(shared.clone());
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize) };
+        Ok(Self {
+            hwnd: hwnd as usize,
+            shared,
+            thread: None, // 消息由宿主线程的泵分发
+        })
+    }
+
+    /// 跟随父窗口拉伸重排（客户区坐标）
+    pub fn set_rect(&self, x: i32, y: i32, w: i32, h: i32) {
+        unsafe {
+            SetWindowPos(
+                self.hwnd(),
+                std::ptr::null_mut(),
+                x,
+                y,
+                w,
+                h,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// 抬到兄弟窗口 z 序顶端（不抢焦点）
+    pub fn raise(&self) {
+        unsafe {
+            SetWindowPos(
+                self.hwnd(),
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
     }
 
     pub fn hwnd(&self) -> HWND {

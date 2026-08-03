@@ -3,7 +3,7 @@
 'use strict';
 
 const { invoke } = window.__TAURI__.core;
-const { listen, emit } = window.__TAURI__.event;
+const { listen } = window.__TAURI__.event;
 
 // ---------- 全局状态 ----------
 const state = {
@@ -75,6 +75,7 @@ async function loadVideo(path) {
     markConnected();
     applySavedSyncOffset();
     renderList();
+    if (singleMode) invoke('webview_ready').catch(() => {}); // 视频加载完成后抬顶+落位视频层
     $('#trans-bar').classList.toggle('hidden', state.lines.length === 0);
     if (res.notice) {
       showNotice(`${esc(res.notice)} <button id="notice-search">去搜索</button>`);
@@ -378,60 +379,16 @@ function setCurrent(idx) {
     el.scrollIntoView({ block: 'nearest' });
     $('#current-sentence').textContent = state.lines[idx]?.text ?? '—';
   }
-  emitFloatbarLine();
-}
-
-// ---------- 悬浮字幕条：事件互通 ----------
-function emitFloatbarLine() {
-  if (!floatBarOn) return;
-  const l = state.lines[state.currentIdx];
-  emit('floatbar:line', {
-    en: l?.text ?? '',
-    zh: (l && state.translations[l.number]) || '',
-  });
-}
-
-function emitFloatbarState(paused) {
-  if (!floatBarOn) return;
-  emit('floatbar:state', {
-    paused: !!paused,
-    loop: state.sentenceLoop,
-    follow: state.followMode,
-    zh: state.showZh,
-  });
-}
-
-// 字幕条按钮 → 本面板 actions 表（单一执行点）
-listen('floatbar:action', (e) => {
-  const fn = actions[e.payload];
-  if (fn) fn();
-});
-// 字幕条拖动后记忆位置（防抖由对端做了，这里直接存）
-listen('floatbar:moved', (e) => {
-  if (!state.settings) return;
-  state.settings.window.float_bar_pos = [e.payload.x, e.payload.y];
-  invoke('save_settings', { settings: state.settings }).catch(() => {});
-});
-// 字幕条窗口就绪握手：补发当前句与状态快照
-listen('floatbar:ready', () => {
-  emitFloatbarLine();
-  mpv('get_property', 'pause').then(emitFloatbarState);
-});
-
-let floatBarOn = null;
-function syncFloatBar(on) {
-  if (on === floatBarOn) return;
-  floatBarOn = on;
-  invoke('toggle_float_bar', { enabled: on }).catch((e) => console.warn('floatbar', e));
 }
 
 // ---------- 轮询播放状态 ----------
 setInterval(async () => {
   if (!state.connected) return;
   const paused = await mpv('get_property', 'pause');
-  if (state.lines.length > 0) {
-    const pos = await mpv('get_property', 'time-pos');
-    if (typeof pos === 'number') {
+  const pos = await mpv('get_property', 'time-pos');
+  if (typeof pos === 'number') {
+    if (singleMode) $('#pos-time').textContent = fmtTime(pos * 1000);
+    if (state.lines.length > 0) {
       setCurrent(findCurrent(pos * 1000));
       if (state.followMode && state.currentIdx >= 0) {
         const line = state.lines[state.currentIdx];
@@ -445,8 +402,8 @@ setInterval(async () => {
   }
   const speed = await mpv('get_property', 'speed');
   if (typeof speed === 'number') $('#speed-label').textContent = speed.toFixed(1) + 'x';
-  // 迷你条：设置开启时跟随播放/暂停自动收放
-  if (state.settings?.window?.mini_bar && typeof paused === 'boolean') {
+  // 迷你条：设置开启时跟随播放/暂停自动收放（单窗口模式无迷你条）
+  if (!singleMode && state.settings?.window?.mini_bar && typeof paused === 'boolean') {
     document.body.classList.toggle('mini', !paused);
   }
   updateBadges(paused);
@@ -467,7 +424,6 @@ async function updateBadges(paused) {
   $('#status-badges').innerHTML = badges
     .map((b) => `<button class="badge" data-badge="${b.id}" title="点击关闭">${b.label}</button>`)
     .join('');
-  emitFloatbarState(paused);
 }
 
 $('#status-badges').addEventListener('click', (e) => {
@@ -635,6 +591,7 @@ const actions = {
   sub_delay_plus_coarse: () => adjustSubDelay(0.5),
   sub_delay_reset: () => adjustSubDelay(0, true),
   toggle_panel: () => {
+    if (singleMode) return toggleDrawer();
     const cur = state.settings?.window?.mini_bar ?? true;
     if (state.settings) state.settings.window.mini_bar = !cur;
     document.body.classList.toggle('mini', cur); // 关闭自动收放时立即展开
@@ -705,6 +662,37 @@ listen('tauri://focus', () => {
   invoke('recall_mpv').catch(() => {}); // mpv 未拉起时静默忽略
 });
 
+// ---------- 单窗口模式（Windows：mpv 画面内嵌主窗口，学习面板收进右侧抽屉） ----------
+let singleMode = false;
+let drawerOpen = false;
+
+function toggleDrawer() {
+  drawerOpen = !drawerOpen;
+  $('#drawer').classList.toggle('hidden', !drawerOpen);
+  invoke('set_drawer', { open: drawerOpen }).catch(() => {});
+}
+
+async function initWindowMode() {
+  try {
+    singleMode = (await invoke('window_mode')) === 'single';
+  } catch { return; }
+  if (!singleMode) return;
+  document.body.classList.add('single');
+  // 面板元素搬入右侧抽屉（事件绑在元素上，搬移后保留）
+  const drawer = $('#drawer');
+  for (const sel of ['#status-badges', '#trans-bar', '#advanced', '#sentence-list', '#mini-bar', '#search-panel', '#settings-drawer']) {
+    drawer.appendChild($(sel));
+  }
+  // 播放控制提上顶栏（从 mini-bar 中提出，插到时间显示前）
+  $('#top-bar').insertBefore($('#transport'), $('#pos-time'));
+  $('#pos-time').classList.remove('hidden');
+  const bp = $('#btn-panel');
+  bp.classList.remove('hidden');
+  bp.addEventListener('click', toggleDrawer);
+  // 通知 Rust 侧 webview 已就绪：抬升并重排 mpv 子窗口
+  invoke('webview_ready').catch(() => {});
+}
+
 // ---------- 启动 / 设置热加载 ----------
 function applySettings(s) {
   state.settings = s;
@@ -714,12 +702,12 @@ function applySettings(s) {
   }
   if (s.copy?.template) state.copyTemplate = s.copy.template;
   if (s.subtitle?.delay_step_ms) state.delayStep = s.subtitle.delay_step_ms / 1000;
-  syncFloatBar(s.window?.float_bar ?? false);
 }
 
 window.addEventListener('settings-saved', (e) => applySettings(e.detail));
 
 (async () => {
+  await initWindowMode();
   try {
     applySettings(await invoke('get_settings'));
   } catch (e) {

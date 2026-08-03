@@ -12,10 +12,10 @@
       {
         "label": "main",
         "title": "loopSub",
-        "width": 440,
-        "height": 760,
-        "minWidth": 300,
-        "minHeight": 200,
+        "width": 1280,
+        "height": 764,
+        "minWidth": 800,
+        "minHeight": 500,
         "alwaysOnTop": false,
         "resizable": true
       }

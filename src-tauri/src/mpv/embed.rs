@@ -179,18 +179,27 @@ pub struct MpvEmbed {
     /// 主动关闭中：通知事件线程退出（wait_event 的 unblock 依赖 libmpv，实测偶发失效）
     closing: Arc<AtomicBool>,
     event_thread: Mutex<Option<JoinHandle<()>>>,
-    /// 自建视频窗口（Phase B）；创建或 wid 设置失败时降级为 mpv 自建窗口
+    /// 自建视频窗口：顶层（Phase B）或嵌入主窗口的子窗口（Phase C 单窗口）；
+    /// 创建或 wid 设置失败时降级为 mpv 自建窗口
     #[cfg(windows)]
     vidwin: Mutex<Option<super::vidwin::VideoWindow>>,
 }
 
+/// 视频子窗口布局（Phase C 单窗口，Windows）：父窗口 HWND + 客户区矩形（物理像素）。
+/// None = 自建顶层视频窗口（Phase B 形态）。非 Windows 平台忽略（mpv 自建窗口）。
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct VidLayout {
+    pub parent: usize,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
 impl MpvEmbed {
-    /// 创建并初始化实例（"缴械"选项与原外部 mpv 的 spawn 参数一致，见 DESIGN.md §2）
-    pub fn new(api: Arc<MpvApi>) -> Result<Self, String> {
-        let handle = unsafe { (api.create)() };
-        if handle.is_null() {
-            return Err("mpv_create 失败".into());
-        }
+    /// 缴械选项（与 DESIGN.md §2 原外部 mpv 的 spawn 参数一致）
+    fn set_base_options(api: &MpvApi, handle: Handle) -> Result<(), String> {
         for (k, v) in [
             ("idle", "yes"),
             ("force-window", "yes"),
@@ -204,51 +213,19 @@ impl MpvEmbed {
             api.check(unsafe { (api.set_option_string)(handle, ck.as_ptr(), cv.as_ptr()) })
                 .map_err(|e| format!("设置 {k}={v} 失败: {e}"))?;
         }
+        Ok(())
+    }
 
-        // Phase B：自建视频窗口 + wid 内嵌；窗口上点 X = 向 core 投递 quit
-        //（与 mpv 自建窗口的默认行为一致）。失败则降级为 mpv 自建窗口。
-        #[cfg(windows)]
-        let vidwin = match super::vidwin::VideoWindow::create({
-            let api = api.clone();
-            let h = handle as usize;
-            move || {
-                let quit = CString::new("quit").unwrap();
-                unsafe { (api.command_string)(h as Handle, quit.as_ptr()) };
-            }
-        }) {
-            Ok(vw) => {
-                let wid = vw.hwnd() as i64;
-                let opt = CString::new("wid").unwrap();
-                let ok = api.check(unsafe {
-                    (api.set_option)(
-                        handle,
-                        opt.as_ptr(),
-                        MPV_FORMAT_INT64,
-                        &wid as *const i64 as *mut c_void,
-                    )
-                });
-                match ok {
-                    Ok(()) => Some(vw),
-                    Err(_) => {
-                        vw.close();
-                        None
-                    }
-                }
-            }
-            Err(_) => None,
-        };
-
-        if let Err(e) = api.check(unsafe { (api.initialize)(handle) }) {
-            unsafe { (api.terminate_destroy)(handle) };
-            return Err(format!("mpv_initialize 失败: {e}"));
-        }
-
-        // 事件线程：消费事件队列，侦测 SHUTDOWN（用户直接关了 mpv 窗口）。
-        // wait_event 用 200ms 超时轮询而非永久阻塞：terminate_destroy 的 unblock
-        // 承诺偶发失效（实测 join 永久卡死），超时+closing 标志保证 join 有硬上界。
-        let dead = Arc::new(AtomicBool::new(false));
-        let closing = Arc::new(AtomicBool::new(false));
-        let event_thread = std::thread::spawn({
+    /// 事件线程：消费事件队列，侦测 SHUTDOWN（用户直接关了 mpv 窗口）。
+    /// wait_event 用 200ms 超时轮询而非永久阻塞：terminate_destroy 的 unblock
+    /// 承诺偶发失效（实测 join 永久卡死），超时+closing 标志保证 join 有硬上界。
+    fn spawn_event_thread(
+        api: &Arc<MpvApi>,
+        handle: Handle,
+        dead: &Arc<AtomicBool>,
+        closing: &Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
+        std::thread::spawn({
             let api = api.clone();
             let dead = dead.clone();
             let closing = closing.clone();
@@ -269,7 +246,84 @@ impl MpvEmbed {
                     }
                 }
             }
-        });
+        })
+    }
+
+    /// 创建并初始化实例（"缴械"选项与原外部 mpv 的 spawn 参数一致，见 DESIGN.md §2）。
+    /// layout：Windows 下 Some = 子窗口嵌入主窗口（Phase C 单窗口），
+    /// None = 自建顶层视频窗口（Phase B）；创建/wid 失败均降级为 mpv 自建窗口。
+    /// app 用于把子窗口创建投递到主线程（非 Windows 忽略）。
+    pub fn new(api: Arc<MpvApi>, layout: Option<VidLayout>, app: &tauri::AppHandle) -> Result<Self, String> {
+        let handle = unsafe { (api.create)() };
+        if handle.is_null() {
+            return Err("mpv_create 失败".into());
+        }
+        Self::set_base_options(&api, handle)?;
+
+        // 自建视频窗口 + wid 内嵌
+        #[cfg(windows)]
+        let vidwin = {
+            let try_create = |layout: Option<VidLayout>| -> Option<super::vidwin::VideoWindow> {
+                let created = match layout {
+                    // Phase C：子窗口嵌入主窗口（命中穿透，输入归 WebView2；
+                    // 无关闭按钮，生命周期随主窗口）。子窗口必须与父窗口同属主线程
+                    // （本函数跑在 tokio 工作线程），故投递创建、经 channel 取回——
+                    // VideoWindow 句柄存 usize，可跨线程移动。调用方不得持 mpv 锁之外的
+                    // 主线程可能等待的锁，否则与主线程形成等待环。
+                    Some(l) => {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        match app.run_on_main_thread(move || {
+                            let _ = tx.send(super::vidwin::VideoWindow::create_child(
+                                l.parent as _, l.x, l.y, l.w, l.h,
+                            ));
+                        }) {
+                            Ok(()) => rx.recv().unwrap_or_else(|_| Err("主线程已退出".into())),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    // Phase B：顶层窗口，点 X = 向 core 投递 quit（同 mpv 自建窗口行为）
+                    None => super::vidwin::VideoWindow::create({
+                        let api = api.clone();
+                        let h = handle as usize;
+                        move || {
+                            let quit = CString::new("quit").unwrap();
+                            unsafe { (api.command_string)(h as Handle, quit.as_ptr()) };
+                        }
+                    }),
+                };
+                created.ok().and_then(|vw| {
+                    let wid = vw.hwnd() as i64;
+                    let opt = CString::new("wid").unwrap();
+                    let ok = api.check(unsafe {
+                        (api.set_option)(
+                            handle,
+                            opt.as_ptr(),
+                            MPV_FORMAT_INT64,
+                            &wid as *const i64 as *mut c_void,
+                        )
+                    });
+                    match ok {
+                        Ok(()) => Some(vw),
+                        Err(_) => {
+                            vw.close();
+                            None
+                        }
+                    }
+                })
+            };
+            try_create(layout)
+        };
+        #[cfg(not(windows))]
+        let _ = (layout, app);
+
+        if let Err(e) = api.check(unsafe { (api.initialize)(handle) }) {
+            unsafe { (api.terminate_destroy)(handle) };
+            return Err(format!("mpv_initialize 失败: {e}"));
+        }
+
+        let dead = Arc::new(AtomicBool::new(false));
+        let closing = Arc::new(AtomicBool::new(false));
+        let event_thread = Self::spawn_event_thread(&api, handle, &dead, &closing);
         Ok(Self {
             api,
             handle: handle as usize,
@@ -386,16 +440,10 @@ impl MpvEmbed {
         })
     }
 
-    /// 视频窗口句柄（Phase B 自建窗口；降级或非 Windows 为 None）
+    /// 视频子窗口（Phase C 单窗口）重排/抬顶；非嵌入形态返回 None
     #[cfg(windows)]
-    pub fn hwnd(&self) -> Option<windows_sys::Win32::Foundation::HWND> {
-        self.vidwin.lock().unwrap().as_ref().map(|v| v.hwnd())
-    }
-
-    /// 视频窗口句柄（Phase B 自建窗口；降级或非 Windows 为 None）
-    #[cfg(not(windows))]
-    pub fn hwnd(&self) -> Option<isize> {
-        None
+    pub fn with_vidwin<R>(&self, f: impl FnOnce(&super::vidwin::VideoWindow) -> R) -> Option<R> {
+        self.vidwin.lock().unwrap().as_ref().map(|v| f(v))
     }
 
     /// 销毁实例；幂等：core 已自行退出（用户关窗口）时仅清理句柄。
