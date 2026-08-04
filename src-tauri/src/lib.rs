@@ -397,6 +397,9 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
             for line in &mut lines {
                 line.text = subtitle::truecase(&line.text);
             }
+            // 画面字幕同步用还原版（与句子列表一致）：落盘 truecased/ 供 sub-add
+            // 挂载；写失败不致命，挂载处会回落 originals 原文
+            let _ = std::fs::write(cache.truecased_path(hash), subtitle::to_srt(&lines));
         }
     }
 
@@ -438,6 +441,13 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
     // （上界 5s）再挂轨；每次循环锁内仅一次查询，sleep 在锁外不挡前端播放轮询
     #[cfg(windows)]
     if source != "none" {
+        // 挂载路径：truecase 开启且有还原文件时用还原版，否则 originals 原文
+        let sub_path = if state.rule_truecase() {
+            let tc = cache.truecased_path(hash);
+            if tc.exists() { tc } else { original.clone() }
+        } else {
+            original.clone()
+        };
         let mut attached = false;
         for _ in 0..50 {
             {
@@ -449,7 +459,7 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
                             attached = ipc
                                 .command(vec![
                                     "sub-add".into(),
-                                    original.to_string_lossy().into_owned().into(),
+                                    sub_path.to_string_lossy().into_owned().into(),
                                     "select".into(),
                                 ])
                                 .await
@@ -528,17 +538,25 @@ async fn download_subtitle(
         for line in &mut lines {
             line.text = subtitle::truecase(&line.text);
         }
+        // 画面字幕同步用还原版（同 load_video）；写失败则挂载处回落 originals
+        let _ = std::fs::write(cache.truecased_path(hash), subtitle::to_srt(&lines));
     }
     // 单窗口形态（Windows）：正在播放时挂给 mpv 渲染画面字幕（此时 demuxer 已就绪）
     #[cfg(windows)]
     {
+        let sub_path = if state.rule_truecase() {
+            let tc = cache.truecased_path(hash);
+            if tc.exists() { tc } else { cache.original_path(hash) }
+        } else {
+            cache.original_path(hash)
+        };
         let guard = state.mpv.lock().await;
         if let Some(ipc) = guard.as_ref() {
             let _ = ipc.set_property("sub-visibility", true.into()).await;
             let _ = ipc
                 .command(vec![
                     "sub-add".into(),
-                    cache.original_path(hash).to_string_lossy().into_owned().into(),
+                    sub_path.to_string_lossy().into_owned().into(),
                     "select".into(),
                 ])
                 .await;
