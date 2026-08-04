@@ -49,12 +49,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEACTIVATE => {
             let shared = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shared;
             if !shared.is_null() && (*shared).input_passthrough {
-                // 穿透形态：不激活不聚焦本窗口且吞掉这一击——否则激活点击的
-                // WM_LBUTTONDOWN 派发到本窗口后 DefWindowProc 会 SetFocus 给自己，
-                // 把主窗口 Focused(true) → set_focus 刚还给 WebView2 的键盘焦点
-                // 抢走（现象：鼠标点画面切回后快捷键全失效，点标题栏却正常）。
-                // 画面区无交互（osc 已关），吞掉无副作用；顶层形态不拦。
-                return MA_NOACTIVATEANDEAT as LRESULT;
+                // 穿透形态：激活主窗口（标题栏正常点亮、Focused(true) →
+                // set_focus 把键盘焦点还给 WebView2），但吞掉这一击的派发——
+                // 否则 WM_LBUTTONDOWN 到本窗口后 DefWindowProc 会 SetFocus 给
+                // 自己，把刚还回去的焦点抢走。必须是 ACTIVATEANDEAT 而非
+                // NOACTIVATEANDEAT：后者连顶层窗口激活一起挡掉（标题栏不亮、
+                // Focused 不触发）。画面区无交互（osc 已关），吞掉无副作用。
+                return MA_ACTIVATEANDEAT as LRESULT;
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
