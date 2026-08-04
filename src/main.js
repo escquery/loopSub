@@ -19,7 +19,8 @@ const state = {
   sentenceLoop: false,
   followMode: false,
   followPausedIdx: -1,
-  showZh: true,
+    showZh: false,
+    zhReveal: new Set(), // 单句翻开译文的字幕 number（全局关闭时仍可逐句查看）
   settings: null,
   hotkeyMap: {},       // combo -> action（由 settings.hotkeys 反转）
   copyTemplate: '请逐句讲解以下美剧台词中的生词、短语和口语用法：\n\n{lines}',
@@ -314,7 +315,7 @@ function renderList() {
       return `<div class="line" data-idx="${i}">
         <span class="no">${l.number}</span>
         <span class="time">${fmtTime(l.start_ms)}</span>
-        <span class="text">${esc(l.text)}${zh ? `<span class="zh">${esc(zh)}</span>` : ''}</span>
+        <span class="text">${esc(l.text)}${zh ? `<span class="zh${state.zhReveal.has(l.number) ? ' reveal' : ''}">${esc(zh)}</span>` : ''}</span>
       </div>`;
     })
     .join('');
@@ -340,6 +341,17 @@ listEl.addEventListener('click', (e) => {
   }
   state.lastClickIdx = idx;
   syncSelectionUI();
+});
+
+// 双击某句：切换该句译文显示（单击仍是 seek；双击触发的两次 seek 落回同一句，无感）
+listEl.addEventListener('dblclick', (e) => {
+  const row = e.target.closest('.line');
+  if (!row) return;
+  const num = state.lines[Number(row.dataset.idx)]?.number;
+  if (num == null) return;
+  state.zhReveal.has(num) ? state.zhReveal.delete(num) : state.zhReveal.add(num);
+  const zhEl = row.querySelector('.zh');
+  if (zhEl) zhEl.classList.toggle('reveal', state.zhReveal.has(num));
 });
 
 function syncSelectionUI() {

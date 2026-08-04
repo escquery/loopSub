@@ -118,6 +118,8 @@ button:hover { border-color: var(--accent); }
   user-select: none;
 }
 body.no-zh .zh { display: none; }
+/* 单句翻开例外：双击某句后该句译文即使全局关闭也显示 */
+body.no-zh .zh.reveal { display: block; }
 
 #mini-bar {
   border-top: 1px solid #3a3d44;
