@@ -448,11 +448,7 @@ $('#status-badges').addEventListener('click', (e) => {
   if (!b) return;
   switch (b.dataset.badge) {
     case 'paused': mpv('cycle', 'pause'); break;
-    case 'ab':
-      mpv('set_property', 'ab-loop-a', 'no');
-      mpv('set_property', 'ab-loop-b', 'no');
-      state.sentenceLoop = false;
-      break;
+    case 'ab': clearAB(); break;
     case 'loop': toggleSentenceLoop(); break;
     case 'follow': toggleFollow(); break;
     case 'delay': adjustSubDelay(0, true); break;
@@ -466,6 +462,13 @@ async function changeSpeed(delta) {
   const next = Math.min(3, Math.max(0.25, Math.round((cur + delta) * 10) / 10));
   await mpv('set_property', 'speed', next);
   osd(next.toFixed(1) + 'x');
+}
+
+// 清除 AB 循环（badge 点击 / 取消 AB 快捷键 / 单句循环关闭共用）
+function clearAB() {
+  state.sentenceLoop = false;
+  mpv('set_property', 'ab-loop-a', 'no');
+  mpv('set_property', 'ab-loop-b', 'no');
 }
 
 async function setABPoint(which) {
@@ -485,9 +488,7 @@ async function nudgeABPoint(which, delta) {
 
 async function toggleSentenceLoop() {
   if (state.sentenceLoop) {
-    await mpv('set_property', 'ab-loop-a', 'no');
-    await mpv('set_property', 'ab-loop-b', 'no');
-    state.sentenceLoop = false;
+    clearAB();
     osd('单句循环 关');
   } else {
     const l = state.lines[state.currentIdx];
@@ -588,6 +589,8 @@ const actions = {
   ab_nudge_b_back: () => nudgeABPoint('b', -0.1),
   ab_nudge_a_fwd: () => nudgeABPoint('a', 0.1),
   ab_nudge_b_fwd: () => nudgeABPoint('b', 0.1),
+  ab_clear: () => { clearAB(); osd('AB循环 取消'); },
+  ab_clear_alt: () => { clearAB(); osd('AB循环 取消'); },
   sentence_loop: () => toggleSentenceLoop(),
   follow_mode: () => toggleFollow(),
   toggle_translation: () => toggleZh(),

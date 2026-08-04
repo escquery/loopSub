@@ -31,6 +31,8 @@ const ACTION_LABELS = {
   ab_nudge_b_back: 'B 点 −100ms',
   ab_nudge_a_fwd: 'A 点 +100ms',
   ab_nudge_b_fwd: 'B 点 +100ms',
+  ab_clear: '取消 AB 循环',
+  ab_clear_alt: '取消 AB 循环（备选键）',
   sentence_loop: '单句循环',
   follow_mode: '跟读模式',
   toggle_translation: '译文显隐',

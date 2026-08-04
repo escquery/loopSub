@@ -238,7 +238,7 @@ impl Default for AnkiSettings {
 
 /// 默认快捷键表（PotPlayer 风格），设置页可全部改绑
 pub fn default_hotkeys() -> HashMap<String, String> {
-    let pairs: [(&str, &str); 26] = [
+    let pairs: [(&str, &str); 28] = [
         ("toggle_pause", "Space"),
         ("seek_back", "ArrowLeft"),
         ("seek_forward", "ArrowRight"),
@@ -253,6 +253,8 @@ pub fn default_hotkeys() -> HashMap<String, String> {
         ("ab_nudge_b_back", "ctrl+]"),
         ("ab_nudge_a_fwd", "alt+["),
         ("ab_nudge_b_fwd", "alt+]"),
+        ("ab_clear", "shift+["),
+        ("ab_clear_alt", "shift+]"),
         ("sentence_loop", "Enter"),
         ("follow_mode", "r"),
         ("toggle_translation", "t"),
@@ -275,8 +277,12 @@ pub fn default_hotkeys() -> HashMap<String, String> {
 impl Settings {
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let settings: Settings =
+        let mut settings: Settings =
             serde_json::from_str(&content).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // 老配置补挂新版本新增的默认热键（仅补缺项；设置页无解绑功能，不会误恢复）
+        for (action, combo) in default_hotkeys() {
+            settings.hotkeys.entry(action).or_insert(combo);
+        }
         Ok(settings)
     }
 
