@@ -314,8 +314,8 @@ function renderList() {
       const zh = state.translations[l.number];
       return `<div class="line" data-idx="${i}">
         <span class="no">${l.number}</span>
-        <span class="time" title="点击显示/隐藏这句翻译">${fmtTime(l.start_ms)}</span>
-        <span class="text">${esc(l.text)}${zh ? `<span class="zh${state.zhReveal.has(l.number) ? ' reveal' : ''}">${esc(zh)}</span>` : ''}</span>
+        <span class="time" title="点击跳转到这句">${fmtTime(l.start_ms)}</span>
+        <span class="text" title="点击显示/隐藏这句翻译">${esc(l.text)}${zh ? `<span class="zh${state.zhReveal.has(l.number) ? ' reveal' : ''}">${esc(zh)}</span>` : ''}</span>
       </div>`;
     })
     .join('');
@@ -328,21 +328,24 @@ listEl.addEventListener('click', (e) => {
   if (!row) return;
   const idx = Number(row.dataset.idx);
 
-  // 点时间戳：只切换该句译文，不 seek（单击英文仍是 seek）
-  if (e.target.closest('.time')) {
-    toggleLineZh(row, idx);
-    return;
-  }
-
   if (e.shiftKey && state.lastClickIdx >= 0) {
     const [a, b] = [Math.min(state.lastClickIdx, idx), Math.max(state.lastClickIdx, idx)];
     state.selected.clear();
     for (let i = a; i <= b; i++) state.selected.add(i);
   } else if (e.ctrlKey || e.metaKey) {
     state.selected.has(idx) ? state.selected.delete(idx) : state.selected.add(idx);
-  } else {
+  } else if (e.target.closest('.time')) {
+    // 点时间戳：跳转播放这句
     state.lastClickIdx = idx;
     seekToLine(idx);
+    return;
+  } else {
+    // 点文字：只切换该句译文，不打断播放。
+    // 拖选复制后松手也会派生 click，选区非折叠时忽略，防误切换
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return;
+    toggleLineZh(row, idx);
+    state.lastClickIdx = idx;
     return;
   }
   state.lastClickIdx = idx;
