@@ -147,9 +147,10 @@ impl MpvApi {
 fn format_of(name: &str) -> c_int {
     match name {
         "time-pos" | "duration" | "percent-pos" | "speed" | "sub-delay" | "sub-speed"
-        | "volume" | "volume-max" | "time-remaining" | "audio-delay" | "cache-speed" => {
-            MPV_FORMAT_DOUBLE
-        }
+        | "volume" | "volume-max" | "time-remaining" | "audio-delay" | "cache-speed"
+        // AB 循环端点：未设置时 mpv 返回错误，设置后是秒数；若走默认 STRING 分支，
+        // 前端 typeof number 守卫会静默丢弃（nudge 失效、AB badge 永不显示）
+        | "ab-loop-a" | "ab-loop-b" => MPV_FORMAT_DOUBLE,
         "pause" | "sub-visibility" | "core-idle" | "eof-reached" | "mute" | "seeking"
         | "idle-active" | "paused-for-cache" => MPV_FORMAT_FLAG,
         "chapter" | "chapter-count" | "playlist-pos" | "playlist-count" | "edition" => {

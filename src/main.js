@@ -428,7 +428,8 @@ setInterval(async () => {
 
 // ---------- 状态徽章（点击即关闭对应功能） ----------
 async function updateBadges(paused) {
-  const abA = await mpv('get_property', 'ab-loop-a');
+  // 未设置 AB 点时 mpv 侧读 ab-loop-a 报错，catch 兜底为 null（badge 不显示）
+  const abA = await mpv('get_property', 'ab-loop-a').catch(() => null);
   const delay = await mpv('get_property', 'sub-delay');
   const badges = [];
   if (paused) badges.push({ id: 'paused', label: '暂停' });
@@ -479,7 +480,8 @@ async function setABPoint(which) {
 }
 
 async function nudgeABPoint(which, delta) {
-  const cur = await mpv('get_property', `ab-loop-${which}`);
+  // 未设置时读取报错（DOUBLE 格式下无“no”值），catch 后静默退出
+  const cur = await mpv('get_property', `ab-loop-${which}`).catch(() => null);
   if (typeof cur !== 'number') return;
   const next = Math.max(0, cur + delta);
   await mpv('set_property', `ab-loop-${which}`, next);
