@@ -1020,6 +1020,24 @@ pub fn run() {
                     let Some(win) = app_handle.get_webview_window("main") else { break };
                     let Ok(hwnd) = win.hwnd() else { break };
                     let main = hwnd.0 as HWND;
+                    // mpv 会在 loopsub-video 内自建 mpv 类子窗口做渲染输出：它一旦
+                    // 持焦键盘就全废（属 libmpv VO 线程，主线程 GUIThreadInfo 看不
+                    // 到，消息也不经我们的 wndproc）。找到就补 WS_DISABLED——不收任
+                    // 何鼠标键盘输入，命中测试穿透回我们的穿透链；渲染不走输入路径
+                    // 无副作用。换视频重建窗口后会自动再补（幂等）。
+                    let vc: Vec<u16> = "loopsub-video".encode_utf16().chain(std::iter::once(0)).collect();
+                    let mc: Vec<u16> = "mpv".encode_utf16().chain(std::iter::once(0)).collect();
+                    let video = unsafe { FindWindowExW(main, std::ptr::null_mut(), vc.as_ptr(), std::ptr::null()) };
+                    if !video.is_null() {
+                        let mpvw = unsafe { FindWindowExW(video, std::ptr::null_mut(), mc.as_ptr(), std::ptr::null()) };
+                        if !mpvw.is_null() {
+                            let style = unsafe { GetWindowLongPtrW(mpvw, GWL_STYLE) };
+                            if style & (WS_DISABLED as isize) == 0 {
+                                unsafe { SetWindowLongPtrW(mpvw, GWL_STYLE, style | (WS_DISABLED as isize)) };
+                                eprintln!("[focus-watchdog] mpv 子窗口已补 WS_DISABLED");
+                            }
+                        }
+                    }
                     // GetFocus 只对调用线程队列有效，必须经 GUIThreadInfo 看主线程
                     let tid = unsafe { GetWindowThreadProcessId(main, std::ptr::null_mut()) };
                     let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
