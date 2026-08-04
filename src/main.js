@@ -398,11 +398,35 @@ function setCurrent(idx) {
   }
 }
 
+// ---------- 画面底部进度条（单窗口模式）：点击/拖动 seek，轮询跟新 ----------
+const progressFill = $('#progress-fill');
+let progressDragging = false;
+function seekToClientX(clientX) {
+  const r = $('#progress-bar').getBoundingClientRect();
+  if (r.width <= 0) return;
+  const pct = Math.min(100, Math.max(0, (clientX - r.left) / r.width * 100));
+  progressFill.style.width = pct + '%';
+  mpv('seek', pct.toFixed(2), 'absolute-percent');
+}
+$('#progress-bar').addEventListener('mousedown', (e) => {
+  if (!singleMode) return;
+  progressDragging = true;
+  seekToClientX(e.clientX);
+  e.preventDefault();
+});
+document.addEventListener('mousemove', (e) => { if (progressDragging) seekToClientX(e.clientX); });
+document.addEventListener('mouseup', () => { progressDragging = false; });
+
 // ---------- 轮询播放状态 ----------
 setInterval(async () => {
   if (!state.connected) return;
   const paused = await mpv('get_property', 'pause');
   const pos = await mpv('get_property', 'time-pos');
+  // 进度条跟新（拖动中由拖动逻辑接管，避免覆盖打架）
+  if (singleMode && !progressDragging) {
+    const pct = await mpv('get_property', 'percent-pos');
+    if (typeof pct === 'number') progressFill.style.width = pct + '%';
+  }
   if (typeof pos === 'number') {
     if (singleMode) $('#pos-time').textContent = fmtTime(pos * 1000);
     if (state.lines.length > 0) {
@@ -693,6 +717,7 @@ let drawerOpen = false;
 function toggleDrawer() {
   drawerOpen = !drawerOpen;
   $('#drawer').classList.toggle('hidden', !drawerOpen);
+  document.body.classList.toggle('drawer-open', drawerOpen);
   invoke('set_drawer', { open: drawerOpen }).catch(() => {});
 }
 

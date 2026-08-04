@@ -32,6 +32,10 @@ pub struct AppState {
 /// 单窗口布局常量（Phase C，Windows）：顶栏高 / 抽屉宽（逻辑像素）
 #[cfg(windows)]
 const BAR_H: f64 = 44.0;
+/// 画面底部常驻进度条高度（DOM 绘制，视频窗口减高让位——进度条若叠在画面
+/// 上会被 loopsub-video 子窗口挡住）
+#[cfg(windows)]
+const PROGRESS_H: f64 = 14.0;
 #[cfg(windows)]
 const DRAWER_W: f64 = 420.0;
 
@@ -57,8 +61,9 @@ fn relayout_video(app: &tauri::AppHandle) {
     // 拿不到就跳过，下次 Resized/ready/drawer 再排。
     let Ok(guard) = state.mpv.try_lock() else { return };
     if let Some(Mpv::Embed(e)) = guard.as_ref() {
+        let progress_h = (PROGRESS_H * scale).round() as i32;
         e.with_vidwin(|vw| {
-            vw.set_rect(0, bar_h, (w - drawer_w).max(1), (h - bar_h).max(1));
+            vw.set_rect(0, bar_h, (w - drawer_w).max(1), (h - bar_h - progress_h).max(1));
             vw.raise();
         });
     }
@@ -251,12 +256,13 @@ async fn mpv_start_internal(state: &AppState, app: &tauri::AppHandle) -> Result<
         } else {
             0
         };
+        let progress_h = (PROGRESS_H * scale).round() as i32;
         Some(mpv::embed::VidLayout {
             parent: win.hwnd().map_err(|e| e.to_string())?.0 as usize,
             x: 0,
             y: bar_h,
             w: (size.width as i32 - drawer_w).max(1),
-            h: (size.height as i32 - bar_h).max(1),
+            h: (size.height as i32 - bar_h - progress_h).max(1),
         })
     };
     #[cfg(not(windows))]

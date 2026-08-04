@@ -298,3 +298,25 @@ body.single #notice-bar {
   position: static;
   max-width: none;
 }
+/* 画面底部常驻进度条：平时 3px 细条贴底，悬停变粗便于点击/拖动 */
+#progress-bar { display: none; }
+body.single #progress-bar {
+  display: block;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 14px;
+  z-index: 30;
+  cursor: pointer;
+}
+body.single.drawer-open #progress-bar { right: 420px; }
+#progress-fill {
+  width: 0;
+  height: 3px;
+  margin-top: 11px;
+  background: var(--accent);
+  transition: height .12s, margin-top .12s;
+  pointer-events: none; /* 交互统一由 bar 收 */
+}
+body.single #progress-bar:hover #progress-fill { height: 8px; margin-top: 6px; }
