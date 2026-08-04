@@ -5,6 +5,9 @@ dist
 .DS_Store
 *.log
 
+# 本地调试产物（截图/探针脚本）
+.proto-shots/
+
 # 打包前下载的外部程序二进制（mpv/ffmpeg/ffprobe，见 release.yml），勿提交；
 # README.txt 为占位文件需保留：bundle.resources 的 "resources/*" glob 至少要匹配一个文件
 /src-tauri/resources/*

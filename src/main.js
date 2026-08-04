@@ -541,7 +541,9 @@ async function autoSync() {
 async function applySavedSyncOffset() {
   try {
     const off = await invoke('get_sync_offset', { videoHash: state.videoHash });
-    if (off) {
+    // speed 必须为正：0/负值会冻结 mpv 字幕时钟（字幕永不显示）；
+    // 后端已对历史毒化配置免疫，此处再挡一道
+    if (off && off.speed > 0) {
       await mpv('set_property', 'sub-delay', off.delay_s);
       await mpv('set_property', 'sub-speed', off.speed);
       osd(`已恢复对齐：${fmtSyncOffset(off.delay_s, off.speed)}`);

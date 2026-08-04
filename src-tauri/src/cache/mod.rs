@@ -22,17 +22,36 @@ pub struct SyncOffset {
     pub speed: f64,
 }
 
+/// sub-speed 的语义默认值：1.0 = 无缩放。
+/// 0 是毒化值——mpv sub-speed=0 会冻结字幕时钟（字幕事件永不激活，
+/// 画面/截图/sub-text 全空），绝不可作为默认值或占位值。
+fn default_speed() -> f64 {
+    1.0
+}
+
 /// 每视频播放配置（videos/<hash>.json）：字幕延迟/速度/播放位置。
-/// 字段全带 serde(default)，旧的只含 delay_s/speed 的文件可直接读入。
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+/// 字段全带 serde(default)，缺字段的旧文件可直接读入。
+/// speed 默认必须是 1.0：历史 bug 把 default 0.0 当对齐结果下发给 mpv，
+/// 字幕整体冻结；已污染的配置由读取端免疫 + 下次保存自动洗白。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct VideoConfig {
     #[serde(default)]
     pub delay_s: f64,
-    #[serde(default)]
+    #[serde(default = "default_speed")]
     pub speed: f64,
     /// 上次播放位置（秒）；< 5 视为从头播
     #[serde(default)]
     pub position_s: f64,
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            delay_s: 0.0,
+            speed: default_speed(),
+            position_s: 0.0,
+        }
+    }
 }
 
 /// 历史记录上限
@@ -95,6 +114,11 @@ impl Cache {
     pub fn load_sync_offset(&self, hash: u64) -> Option<SyncOffset> {
         let data = std::fs::read_to_string(self.video_config_path(hash)).ok()?;
         let cfg: VideoConfig = serde_json::from_str(&data).ok()?;
+        // speed ≤ 0 不是有效对齐结果（合法估计经 SPEED_CLAMP 限定 0.9~1.1），
+        // 是历史 default 0.0 写盘的占位值；按无记录处理，防前端下发 sub-speed=0
+        if cfg.speed <= 0.0 {
+            return None;
+        }
         Some(SyncOffset {
             delay_s: cfg.delay_s,
             speed: cfg.speed,
@@ -104,11 +128,12 @@ impl Cache {
     pub fn save_sync_offset(&self, hash: u64, off: SyncOffset) -> std::io::Result<()> {
         let mut cfg = self.load_video_config(hash);
         cfg.delay_s = off.delay_s;
-        cfg.speed = off.speed;
+        // 写入端钳制：speed 必须为正，异常值归一化（读取端已免疫，此处双保险）
+        cfg.speed = if off.speed > 0.0 { off.speed } else { default_speed() };
         self.save_video_config(hash, &cfg)
     }
 
-    /// 读每视频配置；文件缺失或损坏时回落默认（全 0）
+    /// 读每视频配置；文件缺失或损坏时回落默认（delay/position 归 0，speed 归 1.0）
     pub fn load_video_config(&self, hash: u64) -> VideoConfig {
         std::fs::read_to_string(self.video_config_path(hash))
             .ok()

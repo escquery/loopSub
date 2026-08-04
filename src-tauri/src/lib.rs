@@ -419,6 +419,8 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
             vec!["loadfile".into(), path.clone().into()]
         };
         ipc.command(args).await.map_err(|e| e.to_string())?;
+        // 面板形态（非 Windows）：字幕由面板 mini-bar 渲染，mpv 侧关字幕防双显
+        #[cfg(not(windows))]
         if state.panel_render() {
             let _ = ipc.set_property("sub-visibility", false.into()).await;
         }
@@ -429,6 +431,38 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
     {
         let app2 = app.clone();
         let _ = app.run_on_main_thread(move || relayout_video(&app2));
+    }
+
+    // 单窗口形态（Windows）画面字幕交给 mpv 渲染（字幕条已退役、句子列表收在抽屉里）。
+    // demuxer 异步打开，未就绪时 sub-add 会被拒（mpv error -12）：轮询 duration 至就绪
+    // （上界 5s）再挂轨；每次循环锁内仅一次查询，sleep 在锁外不挡前端播放轮询
+    #[cfg(windows)]
+    if source != "none" {
+        let mut attached = false;
+        for _ in 0..50 {
+            {
+                let guard = state.mpv.lock().await;
+                if let Some(ipc) = guard.as_ref() {
+                    if let Ok(v) = ipc.get_property("duration").await {
+                        if v.as_f64().unwrap_or(0.0) > 0.0 {
+                            let _ = ipc.set_property("sub-visibility", true.into()).await;
+                            attached = ipc
+                                .command(vec![
+                                    "sub-add".into(),
+                                    original.to_string_lossy().into_owned().into(),
+                                    "select".into(),
+                                ])
+                                .await
+                                .is_ok();
+                        }
+                    }
+                }
+            }
+            if attached {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     // 成功加载后写入历史记录（MRU 置顶）
@@ -493,6 +527,21 @@ async fn download_subtitle(
     if state.rule_truecase() {
         for line in &mut lines {
             line.text = subtitle::truecase(&line.text);
+        }
+    }
+    // 单窗口形态（Windows）：正在播放时挂给 mpv 渲染画面字幕（此时 demuxer 已就绪）
+    #[cfg(windows)]
+    {
+        let guard = state.mpv.lock().await;
+        if let Some(ipc) = guard.as_ref() {
+            let _ = ipc.set_property("sub-visibility", true.into()).await;
+            let _ = ipc
+                .command(vec![
+                    "sub-add".into(),
+                    cache.original_path(hash).to_string_lossy().into_owned().into(),
+                    "select".into(),
+                ])
+                .await;
         }
     }
     Ok(lines)
