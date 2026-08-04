@@ -1005,6 +1005,44 @@ pub fn run() {
                     }
                 });
             }
+            // 焦点看门狗（Windows）：鼠标点视频画面激活主窗口时，系统会把键盘
+            // 焦点恢复给“上次持焦的子窗口”——纯显示的视频窗口，MoveFocus 与
+            // WM_MOUSEACTIVATE 拦截都压不住这个时序。轮询发现焦点落在视频窗口
+            // 上（loopsub-video 无输入绑定，持焦必是异常）就投递主线程抢回
+            // WebView2；与 mpv 子类化/消息时序完全无关。主窗口销毁后线程退出。
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::Foundation::HWND;
+                use windows_sys::Win32::UI::WindowsAndMessaging::*;
+                let app_handle = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let Some(win) = app_handle.get_webview_window("main") else { break };
+                    let Ok(hwnd) = win.hwnd() else { break };
+                    let main = hwnd.0 as HWND;
+                    // GetFocus 只对调用线程队列有效，必须经 GUIThreadInfo 看主线程
+                    let tid = unsafe { GetWindowThreadProcessId(main, std::ptr::null_mut()) };
+                    let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
+                    info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+                    if unsafe { GetGUIThreadInfo(tid, &mut info) } == 0 {
+                        continue;
+                    }
+                    if info.hwndActive != main || info.hwndFocus.is_null() {
+                        continue; // 主窗口非激活/无人持焦：不管
+                    }
+                    let mut buf = [0u16; 64];
+                    let n = unsafe { GetClassNameW(info.hwndFocus, buf.as_mut_ptr(), buf.len() as i32) };
+                    if n <= 0 || String::from_utf16_lossy(&buf[..n as usize]) != "loopsub-video" {
+                        continue;
+                    }
+                    let wh = app_handle.clone();
+                    let _ = app_handle.run_on_main_thread(move || {
+                        if let Some(w) = wh.get_webview_window("main") {
+                            let _ = w.set_focus();
+                        }
+                    });
+                });
+            }
             Ok(())
         })
         .manage(AppState {
