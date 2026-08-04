@@ -100,8 +100,9 @@ button:hover { border-color: var(--accent); }
   border-left: 3px solid transparent;
 }
 .line:hover { background: var(--bg-alt); }
-.line .no { color: var(--fg-dim); min-width: 30px; text-align: right; }
-.line .time { color: var(--fg-dim); min-width: 42px; font-variant-numeric: tabular-nums; }
+/* 序号/时间戳不可选中：拖选多行复制时只拿到句子文本（同 .zh 译文处理） */
+.line .no { color: var(--fg-dim); min-width: 30px; text-align: right; user-select: none; }
+.line .time { color: var(--fg-dim); min-width: 42px; font-variant-numeric: tabular-nums; user-select: none; }
 .line .text { flex: 1; }
 .line.current {
   background: var(--current);
