@@ -992,6 +992,15 @@ pub fn run() {
                         // 拉伸重排视频子窗口（顶栏以下、抽屉以左）
                         #[cfg(windows)]
                         tauri::WindowEvent::Resized(_) => relayout_video(&app_handle),
+                        // 切回窗口后把键盘焦点交还 WebView2：失焦再激活后 Chromium
+                        // 内部焦点不自动恢复（页面快捷键全失效，点画面穿透区可救、
+                        // 点标题栏/边框救不回）；set_focus 最终走 WebView2 官方的
+                        // MoveFocus(PROGRAMMATIC) 恢复路径
+                        tauri::WindowEvent::Focused(true) => {
+                            if let Some(w) = app_handle.get_webview_window("main") {
+                                let _ = w.set_focus();
+                            }
+                        }
                         _ => {}
                     }
                 });

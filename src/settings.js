@@ -3,7 +3,15 @@
 'use strict';
 
 // 键盘事件 → 规范化组合键，与 Rust 默认表格式一致：
-// 修饰键顺序 ctrl → alt → shift；单字符小写；空格记为 Space
+// 修饰键顺序 ctrl → alt → shift；单字符小写；空格记为 Space；
+// Shift+符号键按物理键（e.code）归一为基键字符——Shift+[ 的 e.key 是 {，
+// 绑定表统一记基键形式 shift+[（美式物理键位）
+const SHIFT_BASE_KEYS = {
+  BracketLeft: '[', BracketRight: ']', Comma: ',', Period: '.', Slash: '/',
+  Backslash: '\\', Semicolon: ';', Quote: "'", Minus: '-', Equal: '=', Backquote: '`',
+  Digit1: '1', Digit2: '2', Digit3: '3', Digit4: '4', Digit5: '5',
+  Digit6: '6', Digit7: '7', Digit8: '8', Digit9: '9', Digit0: '0',
+};
 window.comboOf = function (e) {
   const parts = [];
   if (e.ctrlKey) parts.push('ctrl');
@@ -11,6 +19,7 @@ window.comboOf = function (e) {
   if (e.shiftKey) parts.push('shift');
   let key = e.key;
   if (key === ' ') key = 'Space';
+  else if (e.shiftKey && SHIFT_BASE_KEYS[e.code]) key = SHIFT_BASE_KEYS[e.code];
   else if (key.length === 1) key = key.toLowerCase();
   parts.push(key);
   return parts.join('+');
