@@ -314,7 +314,7 @@ function renderList() {
       const zh = state.translations[l.number];
       return `<div class="line" data-idx="${i}">
         <span class="no">${l.number}</span>
-        <span class="time">${fmtTime(l.start_ms)}</span>
+        <span class="time" title="点击显示/隐藏这句翻译">${fmtTime(l.start_ms)}</span>
         <span class="text">${esc(l.text)}${zh ? `<span class="zh${state.zhReveal.has(l.number) ? ' reveal' : ''}">${esc(zh)}</span>` : ''}</span>
       </div>`;
     })
@@ -327,6 +327,12 @@ listEl.addEventListener('click', (e) => {
   const row = e.target.closest('.line');
   if (!row) return;
   const idx = Number(row.dataset.idx);
+
+  // 点时间戳：只切换该句译文，不 seek（单击英文仍是 seek）
+  if (e.target.closest('.time')) {
+    toggleLineZh(row, idx);
+    return;
+  }
 
   if (e.shiftKey && state.lastClickIdx >= 0) {
     const [a, b] = [Math.min(state.lastClickIdx, idx), Math.max(state.lastClickIdx, idx)];
@@ -343,16 +349,14 @@ listEl.addEventListener('click', (e) => {
   syncSelectionUI();
 });
 
-// 双击某句：切换该句译文显示（单击仍是 seek；双击触发的两次 seek 落回同一句，无感）
-listEl.addEventListener('dblclick', (e) => {
-  const row = e.target.closest('.line');
-  if (!row) return;
-  const num = state.lines[Number(row.dataset.idx)]?.number;
+// 切换单句译文显示（点行首时间戳触发；全局译文关闭时该句仍可见）
+function toggleLineZh(row, idx) {
+  const num = state.lines[idx]?.number;
   if (num == null) return;
   state.zhReveal.has(num) ? state.zhReveal.delete(num) : state.zhReveal.add(num);
   const zhEl = row.querySelector('.zh');
   if (zhEl) zhEl.classList.toggle('reveal', state.zhReveal.has(num));
-});
+}
 
 function syncSelectionUI() {
   listEl.querySelectorAll('.line').forEach((el) => {
