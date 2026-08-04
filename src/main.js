@@ -745,3 +745,4 @@ window.addEventListener('settings-saved', (e) => applySettings(e.detail));
   }
   refreshHistory();
 })();
+

@@ -708,6 +708,20 @@ async fn recall_mpv(
     win.set_focus().map_err(|e| e.to_string())
 }
 
+/// renderer 焦点恢复链（Windows）：切回窗口后 Chromium renderer 可能未聚焦
+///（document.hasFocus=false，keydown 不进页面），而激活时序下立即 set_focus
+/// 会被忽略，故在 50/150/400ms 延迟点重试（set_focus → WebView2 MoveFocus，幂等）
+#[cfg(windows)]
+fn spawn_focus_recovery(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        for delay in [50u64, 150, 400] {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            let Some(w) = app.get_webview_window("main") else { return };
+            let _ = w.set_focus();
+        }
+    });
+}
+
 // ---------- 字幕自动对齐 ----------
 
 #[derive(serde::Serialize)]
@@ -993,13 +1007,14 @@ pub fn run() {
                         #[cfg(windows)]
                         tauri::WindowEvent::Resized(_) => relayout_video(&app_handle),
                         // 切回窗口后把键盘焦点交还 WebView2：失焦再激活后 Chromium
-                        // 内部焦点不自动恢复（页面快捷键全失效，点画面穿透区可救、
-                        // 点标题栏/边框救不回）；set_focus 最终走 WebView2 官方的
-                        // MoveFocus(PROGRAMMATIC) 恢复路径
+                        // 内部焦点不自动恢复（页面快捷键全失效）；激活时序下立即
+                        // MoveFocus 会被忽略，走延迟重试链恢复
                         tauri::WindowEvent::Focused(true) => {
                             if let Some(w) = app_handle.get_webview_window("main") {
                                 let _ = w.set_focus();
                             }
+                            #[cfg(windows)]
+                            spawn_focus_recovery(app_handle.clone());
                         }
                         _ => {}
                     }
@@ -1015,7 +1030,8 @@ pub fn run() {
                 use windows_sys::Win32::Foundation::HWND;
                 use windows_sys::Win32::UI::WindowsAndMessaging::*;
                 let app_handle = app.handle().clone();
-                std::thread::spawn(move || loop {
+                std::thread::spawn(move || {
+                    loop {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     let Some(win) = app_handle.get_webview_window("main") else { break };
                     let Ok(hwnd) = win.hwnd() else { break };
@@ -1034,7 +1050,16 @@ pub fn run() {
                             let style = unsafe { GetWindowLongPtrW(mpvw, GWL_STYLE) };
                             if style & (WS_DISABLED as isize) == 0 {
                                 unsafe { SetWindowLongPtrW(mpvw, GWL_STYLE, style | (WS_DISABLED as isize)) };
-                                eprintln!("[focus-watchdog] mpv 子窗口已补 WS_DISABLED");
+                            }
+                            // WS_DISABLED 只断输入不断命中：disabled 窗口的 NCHITTEST
+                            // 仍返回 HTCLIENT，鼠标 down 派发给它后被系统直接丢弃——
+                            // 穿透链断、主窗口不激活（实测病根：点画面窗口不置前）。
+                            // 补 WS_EX_TRANSPARENT 让命中测试整体跳过它（WebView2 自带
+                            // 的 D3D 输出窗口同为 disabled，就靠此样式让位）；只影响
+                            // 命中测试，不影响 mpv 渲染输出
+                            let exstyle = unsafe { GetWindowLongPtrW(mpvw, GWL_EXSTYLE) };
+                            if exstyle & (WS_EX_TRANSPARENT as isize) == 0 {
+                                unsafe { SetWindowLongPtrW(mpvw, GWL_EXSTYLE, exstyle | (WS_EX_TRANSPARENT as isize)) };
                             }
                         }
                     }
@@ -1045,18 +1070,22 @@ pub fn run() {
                     if unsafe { GetGUIThreadInfo(tid, &mut info) } == 0 {
                         continue;
                     }
+                    let mut buf = [0u16; 64];
+                    let n = if info.hwndFocus.is_null() {
+                        0
+                    } else {
+                        unsafe { GetClassNameW(info.hwndFocus, buf.as_mut_ptr(), buf.len() as i32) }
+                    };
+                    let name = if n > 0 { String::from_utf16_lossy(&buf[..n as usize]) } else { String::new() };
                     if info.hwndActive != main || info.hwndFocus.is_null() {
                         continue; // 主窗口非激活/无人持焦：不管
                     }
-                    let mut buf = [0u16; 64];
-                    let n = unsafe { GetClassNameW(info.hwndFocus, buf.as_mut_ptr(), buf.len() as i32) };
-                    if n <= 0 {
+                    if name.is_empty() {
                         continue;
                     }
                     // 白名单：焦点在 wry 容器及其下的 WebView2/Chromium 窗口即正常；
                     // 其余（主窗口框架、loopsub-video 纯显示层等）DOM 都收不到键盘，
                     // 一律抢回。放宽原因：激活时系统恢复的焦点目标并不固定。
-                    let name = String::from_utf16_lossy(&buf[..n as usize]);
                     let normal = name.starts_with("WRY_WEBVIEW")
                         || name.starts_with("Chrome_WidgetWin")
                         || name.starts_with("Windows.UI.Core.CoreWindow");
@@ -1069,6 +1098,7 @@ pub fn run() {
                             let _ = w.set_focus();
                         }
                     });
+                    }
                 });
             }
             Ok(())

@@ -24,10 +24,12 @@ struct Shared {
     on_close: Box<dyn Fn() + Send + Sync>,
     /// 鼠标命中穿透（子窗口嵌入形态）：视频层纯显示，输入全归下层 WebView2
     input_passthrough: bool,
-    /// 焦点踢传目标（子窗口嵌入形态）：兄弟的 wry 容器窗口（WRY_WEBVIEW）。
-    /// 本窗口纯显示、无任何输入绑定，键盘焦点落下必是异常（激活时系统把
-    /// 焦点恢复给“上次持焦的子窗口”），WM_SETFOCUS 里同步踢给它——它的
-    /// wndproc 会把焦点下传到 WebView 文档，完成 Chromium 聚焦链。0 = 无。
+    /// 焦点踢传目标（子窗口嵌入形态）：主窗口本身。
+    /// 本窗口纯显示、无任何输入绑定，键盘焦点落下必是异常（鼠标 down 经
+    /// DefWindowProc 会 SetFocus 到这里），WM_SETFOCUS 里同步踢回主窗口——
+    /// wry 在主窗口挂了 subclass（SETFOCUS → MoveFocus），唯有焦点落到主
+    /// 窗口才触发 renderer 聚焦链；踢给 WRY_WEBVIEW 会跳过主窗口，Win32
+    /// 焦点链看似完整但 MoveFocus 通知没发，renderer 永不聚焦。0 = 无。
     focus_target: usize,
 }
 
@@ -55,8 +57,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_SETFOCUS => {
             let shared = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shared;
             if !shared.is_null() && (*shared).input_passthrough && (*shared).focus_target != 0 {
-                // 焦点落下即同步踢走（嵌套焦点转移是 Win32 常规操作）：
-                // 比看门狗轮询实时，也不依赖 mpv 子类化之外的消息时序
+                // 焦点落下即同步踢回主窗口（嵌套焦点转移是 Win32 常规操作），
+                // 由 wry 挂在主窗口的 subclass 完成 MoveFocus → renderer 聚焦
                 SetFocus((*shared).focus_target as HWND);
                 return 0;
             }
@@ -65,21 +67,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEACTIVATE => {
             let shared = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shared;
             if !shared.is_null() && (*shared).input_passthrough {
-                // 穿透形态：激活主窗口（标题栏正常点亮、Focused(true) →
-                // set_focus 把键盘焦点还给 WebView2），但吞掉这一击的派发——
-                // 否则 WM_LBUTTONDOWN 到本窗口后 DefWindowProc 会 SetFocus 给
-                // 自己，把刚还回去的焦点抢走。必须是 ACTIVATEANDEAT 而非
-                // NOACTIVATEANDEAT：后者连顶层窗口激活一起挡掉（标题栏不亮、
-                // Focused 不触发）。画面区无交互（osc 已关），吞掉无副作用。
-                return MA_ACTIVATEANDEAT as LRESULT;
+                return MA_ACTIVATE as LRESULT;
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_NCHITTEST => {
             let shared = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shared;
             if !shared.is_null() && (*shared).input_passthrough {
-                // 穿透到下层兄弟（WebView2）：按键/点击/滚轮全归 UI 层
-                return HTTRANSPARENT as LRESULT;
+                // 必须命中本窗口（HTCLIENT），不得 HTTRANSPARENT 穿透：穿透后
+                // hit-test 落在跨进程的 WebView2 输入窗口链上，实测鼠标 down
+                // 无人接收——主窗口不激活不置前、renderer 永不聚焦、快捷键全废。
+                // 命中本窗口后系统走标准激活路径（激活+置前+SetFocus），焦点经
+                // 上面 WM_SETFOCUS 踢回主窗口 → wry MoveFocus → renderer 聚焦。
+                // 画面区无任何鼠标交互（字幕交互全在右侧面板），吃掉无副作用
+                return HTCLIENT as LRESULT;
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -212,21 +213,17 @@ impl VideoWindow {
     /// 子窗口形态（Phase C 叠层单窗口）：在**调用线程**创建——调用方必须保证
     /// 这是主线程（embed 经 run_on_main_thread 投递；Tauri 主线程 event loop
     /// 顺带 Dispatch 子窗口消息）。
-    /// 为何不开专用线程：命中穿透（HTTRANSPARENT）与 SetWindowPos 重排都只在
-    /// 同线程窗口间可靠工作；跨线程实测死锁（主窗口 Responding=False）。
-    /// 输入穿透——视频层纯显示，鼠标/键盘全归下层的 WebView2 UI。
+    /// 为何不开专用线程：SetWindowPos 重排只在同线程窗口间可靠工作；
+    /// 跨线程实测死锁（主窗口 Responding=False）。
+    /// 输入处理——视频层纯显示且画面区无任何鼠标交互：NCHITTEST 命中本窗口
+    /// （吃掉鼠标换标准激活路径），键盘焦点经 WM_SETFOCUS 踢回主窗口。
     pub fn create_child(parent: HWND, x: i32, y: i32, w: i32, h: i32) -> Result<Self, String> {
-        // 找兄弟的 wry 容器窗口作为焦点踢传目标（其 WM_SETFOCUS 处理会把
-        // 焦点下传到 WebView 文档）；找不到则 0（踢传分支自动禁用）
-        let wry_class: Vec<u16> = "WRY_WEBVIEW".encode_utf16().chain(std::iter::once(0)).collect();
-        let focus_target = unsafe {
-            FindWindowExW(parent, std::ptr::null_mut(), wry_class.as_ptr(), std::ptr::null())
-        } as usize;
+        // 焦点踢传目标 = 主窗口（理由见 Shared.focus_target 注释）
         let shared = Arc::new(Shared {
             destroyed: AtomicBool::new(false),
             on_close: Box::new(|| {}), // 子窗口无关闭按钮，不会触发
             input_passthrough: true,
-            focus_target,
+            focus_target: parent as usize,
         });
         let hwnd = unsafe {
             create_window(&WinCfg {
