@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 /// 通知窗口线程销毁窗口（MpvEmbed 清理路径；WM_APP 起的应用私有消息）
@@ -23,6 +24,11 @@ struct Shared {
     on_close: Box<dyn Fn() + Send + Sync>,
     /// 鼠标命中穿透（子窗口嵌入形态）：视频层纯显示，输入全归下层 WebView2
     input_passthrough: bool,
+    /// 焦点踢传目标（子窗口嵌入形态）：兄弟的 wry 容器窗口（WRY_WEBVIEW）。
+    /// 本窗口纯显示、无任何输入绑定，键盘焦点落下必是异常（激活时系统把
+    /// 焦点恢复给“上次持焦的子窗口”），WM_SETFOCUS 里同步踢给它——它的
+    /// wndproc 会把焦点下传到 WebView 文档，完成 Chromium 聚焦链。0 = 无。
+    focus_target: usize,
 }
 
 pub struct VideoWindow {
@@ -45,6 +51,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_VIDWIN_CLOSE => {
             DestroyWindow(hwnd);
             0
+        }
+        WM_SETFOCUS => {
+            let shared = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shared;
+            if !shared.is_null() && (*shared).input_passthrough && (*shared).focus_target != 0 {
+                // 焦点落下即同步踢走（嵌套焦点转移是 Win32 常规操作）：
+                // 比看门狗轮询实时，也不依赖 mpv 子类化之外的消息时序
+                SetFocus((*shared).focus_target as HWND);
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_MOUSEACTIVATE => {
             let shared = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shared;
@@ -143,6 +159,7 @@ impl VideoWindow {
             destroyed: AtomicBool::new(false),
             on_close: Box::new(on_close),
             input_passthrough,
+            focus_target: 0, // 顶层形态不踢传
         });
         let shared2 = shared.clone();
         let thread = std::thread::spawn(move || {
@@ -199,10 +216,17 @@ impl VideoWindow {
     /// 同线程窗口间可靠工作；跨线程实测死锁（主窗口 Responding=False）。
     /// 输入穿透——视频层纯显示，鼠标/键盘全归下层的 WebView2 UI。
     pub fn create_child(parent: HWND, x: i32, y: i32, w: i32, h: i32) -> Result<Self, String> {
+        // 找兄弟的 wry 容器窗口作为焦点踢传目标（其 WM_SETFOCUS 处理会把
+        // 焦点下传到 WebView 文档）；找不到则 0（踢传分支自动禁用）
+        let wry_class: Vec<u16> = "WRY_WEBVIEW".encode_utf16().chain(std::iter::once(0)).collect();
+        let focus_target = unsafe {
+            FindWindowExW(parent, std::ptr::null_mut(), wry_class.as_ptr(), std::ptr::null())
+        } as usize;
         let shared = Arc::new(Shared {
             destroyed: AtomicBool::new(false),
             on_close: Box::new(|| {}), // 子窗口无关闭按钮，不会触发
             input_passthrough: true,
+            focus_target,
         });
         let hwnd = unsafe {
             create_window(&WinCfg {

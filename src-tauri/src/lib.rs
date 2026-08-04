@@ -1032,7 +1032,17 @@ pub fn run() {
                     }
                     let mut buf = [0u16; 64];
                     let n = unsafe { GetClassNameW(info.hwndFocus, buf.as_mut_ptr(), buf.len() as i32) };
-                    if n <= 0 || String::from_utf16_lossy(&buf[..n as usize]) != "loopsub-video" {
+                    if n <= 0 {
+                        continue;
+                    }
+                    // 白名单：焦点在 wry 容器及其下的 WebView2/Chromium 窗口即正常；
+                    // 其余（主窗口框架、loopsub-video 纯显示层等）DOM 都收不到键盘，
+                    // 一律抢回。放宽原因：激活时系统恢复的焦点目标并不固定。
+                    let name = String::from_utf16_lossy(&buf[..n as usize]);
+                    let normal = name.starts_with("WRY_WEBVIEW")
+                        || name.starts_with("Chrome_WidgetWin")
+                        || name.starts_with("Windows.UI.Core.CoreWindow");
+                    if normal {
                         continue;
                     }
                     let wh = app_handle.clone();
