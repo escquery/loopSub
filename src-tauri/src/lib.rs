@@ -82,7 +82,9 @@ fn window_mode() -> &'static str {
     return "panel";
 }
 
-/// 抽屉开合：记录状态并重排视频区
+/// 抽屉开合：主窗口随抽屉右扩/收回 DRAWER_W，视频区大小不变（画面不缩不动）。
+/// 右扩时若超出显示器工作区右缘先左移让位，还不够才收缩宽度；最大化时跳过
+///（拉伸最大化窗口会退出最大化，反而怪异）。关闭对称收回，带最小宽度保护。
 #[tauri::command]
 fn set_drawer(
     app: tauri::AppHandle,
@@ -92,6 +94,39 @@ fn set_drawer(
     *state.drawer_open.lock().unwrap() = open;
     #[cfg(windows)]
     {
+        if let Some(win) = app.get_webview_window("main") {
+            if !win.is_maximized().unwrap_or(false) {
+                let scale = win.scale_factor().unwrap_or(1.0);
+                let delta = (DRAWER_W * scale).round() as i32; // 物理像素
+                if let (Ok(inner), Ok(pos)) = (win.inner_size(), win.outer_position()) {
+                    let (mut w, h) = (inner.width as i32, inner.height as i32);
+                    let mut x = pos.x;
+                    if open {
+                        w += delta;
+                        if let Ok(Some(m)) = win.current_monitor() {
+                            let wa = m.work_area();
+                            let right = wa.position.x + wa.size.width as i32;
+                            if x + w > right {
+                                x = (right - w).max(wa.position.x);
+                            }
+                            if w > wa.size.width as i32 {
+                                w = wa.size.width as i32;
+                            }
+                        }
+                    } else {
+                        w = (w - delta).max((320.0 * scale) as i32);
+                    }
+                    let _ = win.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
+                        w as u32, h as u32,
+                    )));
+                    if x != pos.x {
+                        let _ = win.set_position(tauri::Position::Physical(
+                            tauri::PhysicalPosition::new(x, pos.y),
+                        ));
+                    }
+                }
+            }
+        }
         // 重排要做 SetWindowPos，必须在子窗口所属的主线程执行（command 跑在工作线程）
         let app2 = app.clone();
         let _ = app.run_on_main_thread(move || relayout_video(&app2));
@@ -105,6 +140,51 @@ fn take_startup_video(state: tauri::State<'_, AppState>) -> Option<String> {
     state.pending_video.lock().unwrap().take()
 }
 
+/// 窗口重置为视频原始大小（顶栏 1:1 按钮 / 快捷键）：视频子窗口物理尺寸
+/// 对齐视频显示像素（dwidth/dheight，1:1 不缩放），主窗口按布局反推
+///（顶栏+进度条+抽屉）。超出当前显示器工作区时等比缩到能放下（不再 1:1）。
+/// set_size 触发 Resized → relayout_video 自动重排视频子窗口。非 Windows 无操作。
+#[tauri::command]
+fn fit_window_to_video(
+    app: tauri::AppHandle,
+    #[allow(unused_variables)] state: tauri::State<'_, AppState>,
+    w: f64,
+    h: f64,
+) -> Result<(), String> {
+    if w <= 0.0 || h <= 0.0 {
+        return Err("视频尺寸不可用".into());
+    }
+    #[cfg(windows)]
+    {
+        let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
+        let scale = win.scale_factor().map_err(|e| e.to_string())?;
+        let drawer_w = if *state.drawer_open.lock().unwrap() {
+            DRAWER_W
+        } else {
+            0.0
+        };
+        // 视频区物理像素 = w×h → CSS 尺寸 = 物理/scale
+        let mut win_w = w / scale + drawer_w;
+        let mut win_h = BAR_H + h / scale + PROGRESS_H;
+        if let Ok(Some(m)) = win.current_monitor() {
+            let wa = m.work_area();
+            // 高向再留 48 给标题栏/边框：work_area 限外框，set_size 设的是客户区
+            let max_w = wa.size.width as f64 / scale;
+            let max_h = wa.size.height as f64 / scale - 48.0;
+            let shrink = (max_w / win_w).min(max_h / win_h).min(1.0);
+            win_w = (win_w * shrink).floor();
+            win_h = (win_h * shrink).floor();
+        }
+        win.set_size(tauri::Size::Logical(tauri::LogicalSize::new(win_w, win_h)))
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, w, h);
+    }
+    Ok(())
+}
+
 /// 资源管理器右键菜单状态（注册表即真相；非 Windows 恒 false）
 #[tauri::command]
 fn get_explorer_menu() -> bool {
@@ -116,14 +196,20 @@ fn get_explorer_menu() -> bool {
 
 /// 注册/移除资源管理器右键菜单（"用 loopSub 播放"；非 Windows 无操作）
 #[tauri::command]
-fn set_explorer_menu(enable: bool) -> Result<(), String> {
+fn set_explorer_menu(state: tauri::State<'_, AppState>, enable: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
-        if enable {
+        let r = if enable {
             explorer_menu::register()
         } else {
             explorer_menu::unregister()
-        }
+        };
+        r?;
+        // 记忆用户显式选择（启动同步以此为淮）
+        let mut s = state.settings.lock().unwrap();
+        s.explorer_context_menu = Some(enable);
+        let _ = s.save(&state.settings_path);
+        Ok(())
     }
     #[cfg(not(windows))]
     {
@@ -1022,7 +1108,22 @@ pub fn run() {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("loopsub")
         .join("settings.json");
-    let settings = Settings::load(&settings_path).unwrap_or_default();
+    let mut settings = Settings::load(&settings_path).unwrap_or_default();
+    // 资源管理器右键菜单默认开启：首次启动（未做过选择）注册并记忆；之后每次
+    // 启动按设置状态与注册表对齐（重写一遍顺带修复便携版移动后的路径漂移）
+    #[cfg(windows)]
+    {
+        let want = settings.explorer_context_menu.unwrap_or(true);
+        let r = if want {
+            explorer_menu::register()
+        } else {
+            explorer_menu::unregister()
+        };
+        if r.is_ok() && settings.explorer_context_menu != Some(want) {
+            settings.explorer_context_menu = Some(want);
+            let _ = settings.save(&settings_path);
+        }
+    }
     // 右键菜单/命令行传入的视频路径：只认真实存在的文件，其余参数一律忽略
     let pending_video = std::env::args()
         .nth(1)
@@ -1184,6 +1285,7 @@ pub fn run() {
             set_drawer,
             webview_ready,
             take_startup_video,
+            fit_window_to_video,
             get_explorer_menu,
             set_explorer_menu,
         ])

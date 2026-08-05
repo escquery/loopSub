@@ -144,6 +144,7 @@ $('#btn-history').addEventListener('click', () => {
   $('#history-panel').classList.toggle('hidden');
 });
 $('#btn-history-close').addEventListener('click', () => $('#history-panel').classList.add('hidden'));
+$('#btn-fit').addEventListener('click', () => fitVideoWindow());
 
 $('#history-list').addEventListener('click', (e) => {
   const item = e.target.closest('.history-item');
@@ -358,13 +359,22 @@ listEl.addEventListener('click', (e) => {
   syncSelectionUI();
 });
 
-// 切换单句译文显示（点行首时间戳触发；全局译文关闭时该句仍可见）
+// 切换单句译文显示（点文字 / Ctrl+F 触发；全局译文关闭时该句仍可见）
 function toggleLineZh(row, idx) {
   const num = state.lines[idx]?.number;
   if (num == null) return;
   state.zhReveal.has(num) ? state.zhReveal.delete(num) : state.zhReveal.add(num);
   const zhEl = row.querySelector('.zh');
   if (zhEl) zhEl.classList.toggle('reveal', state.zhReveal.has(num));
+}
+
+// 开关当前句译文（快捷键）：复用单句翻开机制；该句无译文时提示不动
+function toggleCurrentZh() {
+  const l = state.lines[state.currentIdx];
+  if (!l) return;
+  if (!state.translations[l.number]) return osd('当前句暂无译文');
+  const row = listEl.querySelector(`.line[data-idx="${state.currentIdx}"]`);
+  if (row) toggleLineZh(row, state.currentIdx);
 }
 
 function syncSelectionUI() {
@@ -627,6 +637,7 @@ const actions = {
   sentence_loop: () => toggleSentenceLoop(),
   follow_mode: () => toggleFollow(),
   toggle_translation: () => toggleZh(),
+  reveal_current_translation: () => toggleCurrentZh(),
   select_current: () => {
     if (state.currentIdx >= 0) {
       state.selected.add(state.currentIdx);
@@ -653,6 +664,7 @@ const actions = {
     osd(cur ? '自动收放 关' : '自动收放 开');
   },
   recall_mpv: () => invoke('recall_mpv').then(() => osd('已召回 mpv')).catch(osd),
+  fit_video_window: () => fitVideoWindow(),
   anki_export: () => exportAnki(),
 };
 
@@ -701,6 +713,22 @@ document.addEventListener('keydown', (e) => {
   e.preventDefault();
   copySelected();
 });
+
+// 窗口重置为视频原始大小（顶栏 1:1 按钮 / 快捷键）：dwidth/dheight 为显示
+// 像素（已含宽高比/旋转），尺寸计算与 set_size 由 Rust 侧完成（含工作区上限）
+async function fitVideoWindow() {
+  if (!state.connected) return;
+  const w = await mpv('get_property', 'dwidth');
+  const h = await mpv('get_property', 'dheight');
+  if (typeof w !== 'number' || typeof h !== 'number' || w <= 0 || h <= 0) {
+    return osd('视频尺寸不可用');
+  }
+  try {
+    await invoke('fit_window_to_video', { w, h });
+  } catch (e) {
+    osd('调整失败: ' + e);
+  }
+}
 
 // ---------- 窗口行为：失焦沉底 / 切回召回 mpv ----------
 let blurredAt = 0;

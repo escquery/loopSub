@@ -18,6 +18,9 @@ pub struct Settings {
     pub bins: BinSettings,
     pub window: WindowSettings,
     pub anki: AnkiSettings,
+    /// 资源管理器右键菜单“用 loopSub 播放”（仅 Windows）：None = 未做过选择，
+    /// 首次启动按默认开启处理；Some 为用户显式选择，启动时与注册表对齐
+    pub explorer_context_menu: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +140,7 @@ impl Default for Settings {
             bins: BinSettings::default(),
             window: WindowSettings::default(),
             anki: AnkiSettings::default(),
+            explorer_context_menu: None,
         }
     }
 }
@@ -238,7 +242,7 @@ impl Default for AnkiSettings {
 
 /// 默认快捷键表（PotPlayer 风格），设置页可全部改绑
 pub fn default_hotkeys() -> HashMap<String, String> {
-    let pairs: [(&str, &str); 28] = [
+    let pairs: [(&str, &str); 30] = [
         ("toggle_pause", "Space"),
         ("seek_back", "ArrowLeft"),
         ("seek_forward", "ArrowRight"),
@@ -258,6 +262,7 @@ pub fn default_hotkeys() -> HashMap<String, String> {
         ("sentence_loop", "Enter"),
         ("follow_mode", "r"),
         ("toggle_translation", "t"),
+        ("reveal_current_translation", "ctrl+f"),
         ("select_current", "v"),
         ("sub_delay_minus", "alt+ArrowLeft"),
         ("sub_delay_plus", "alt+ArrowRight"),
@@ -266,6 +271,7 @@ pub fn default_hotkeys() -> HashMap<String, String> {
         ("sub_delay_reset", "alt+0"),
         ("toggle_panel", "s"),
         ("recall_mpv", "w"),
+        ("fit_video_window", "1"),
         ("anki_export", "k"),
     ];
     pairs

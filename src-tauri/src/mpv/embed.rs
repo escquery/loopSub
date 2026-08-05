@@ -153,7 +153,10 @@ fn format_of(name: &str) -> c_int {
         | "ab-loop-a" | "ab-loop-b" => MPV_FORMAT_DOUBLE,
         "pause" | "sub-visibility" | "core-idle" | "eof-reached" | "mute" | "seeking"
         | "idle-active" | "paused-for-cache" => MPV_FORMAT_FLAG,
-        "chapter" | "chapter-count" | "playlist-pos" | "playlist-count" | "edition" => {
+        "chapter" | "chapter-count" | "playlist-pos" | "playlist-count" | "edition"
+        // dwidth/dheight：视频显示像素；STRING 分支会返回 "1920" 字符串，
+        // 前端 typeof number 守卫静默丢弃（窗口重置为视频大小失效）
+        | "dwidth" | "dheight" => {
             MPV_FORMAT_INT64
         }
         _ => MPV_FORMAT_STRING,

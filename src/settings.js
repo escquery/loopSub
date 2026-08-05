@@ -46,6 +46,7 @@ const ACTION_LABELS = {
   sentence_loop: '单句循环',
   follow_mode: '跟读模式',
   toggle_translation: '译文显隐',
+  reveal_current_translation: '当前句译文显隐',
   select_current: '选中当前句',
   sub_delay_minus: '字幕延迟 −0.1s',
   sub_delay_plus: '字幕延迟 +0.1s',
@@ -54,6 +55,7 @@ const ACTION_LABELS = {
   sub_delay_reset: '字幕延迟归零',
   toggle_panel: '自动收放面板',
   recall_mpv: '召回 mpv 窗口',
+  fit_video_window: '窗口重置为视频大小',
   anki_export: '导出当前句到 Anki',
 };
 
