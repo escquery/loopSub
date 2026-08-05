@@ -752,6 +752,11 @@ async function initWindowMode() {
   }
   // 通知 Rust 侧 webview 已就绪：抬升并重排 mpv 子窗口
   invoke('webview_ready').catch(() => {});
+  // 右键菜单“用 loopSub 播放”带入的启动视频（Rust 侧启动参数解析，取出一次即消费）
+  try {
+    const startup = await invoke('take_startup_video');
+    if (startup) loadVideo(startup);
+  } catch {}
 }
 
 // ---------- 启动 / 设置热加载 ----------

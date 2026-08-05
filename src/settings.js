@@ -67,6 +67,13 @@ const SettingsUI = {
     this.settings = await tauriInvoke('get_settings');
     this.render();
     $s('#settings-drawer').classList.remove('hidden');
+    // 右键菜单开关（仅 Windows 显示；状态以注册表为准，不落 settings.json）
+    tauriInvoke('window_mode').then(async (mode) => {
+      if (mode !== 'single') return;
+      const on = await tauriInvoke('get_explorer_menu').catch(() => false);
+      $s('#explorer-menu-section').hidden = false;
+      $s('#explorer-menu').checked = on;
+    });
   },
 
   close() {
@@ -130,6 +137,10 @@ const SettingsUI = {
         <label class="row"><input type="checkbox" data-k="window.mini_bar" ${s.window.mini_bar ? 'checked' : ''} /> 播放时自动收起为迷你条</label>
         <label class="row"><input type="checkbox" data-k="window.sink_on_blur" ${s.window.sink_on_blur ? 'checked' : ''} /> 切走时取消置顶（沉底）</label>
         <label class="row"><input type="checkbox" data-k="window.recall_mpv_on_focus" ${s.window.recall_mpv_on_focus ? 'checked' : ''} /> 切回时召回 mpv 窗口</label>
+      </section>
+      <section id="explorer-menu-section" hidden>
+        <h3>系统集成</h3>
+        <label class="row"><input type="checkbox" id="explorer-menu" /> 资源管理器右键菜单：视频文件“用 loopSub 播放”</label>
       </section>
       <section>
         <h3>Anki（需装 AnkiConnect 插件并启动 Anki）</h3>
@@ -219,6 +230,19 @@ $s('#btn-settings-save').addEventListener('click', async () => {
     setTimeout(() => ($s('#settings-msg').textContent = ''), 2000);
   } catch (e) {
     $s('#settings-msg').textContent = '保存失败: ' + e;
+  }
+});
+
+// 右键菜单开关：立即生效（写/删 HKCU 注册表），失败回滚勾选
+$s('#settings-body').addEventListener('change', async (e) => {
+  if (e.target.id !== 'explorer-menu') return;
+  try {
+    await tauriInvoke('set_explorer_menu', { enable: e.target.checked });
+    $s('#settings-msg').textContent = e.target.checked ? '右键菜单已添加' : '右键菜单已移除';
+    setTimeout(() => ($s('#settings-msg').textContent = ''), 2000);
+  } catch (err) {
+    e.target.checked = !e.target.checked;
+    $s('#settings-msg').textContent = '右键菜单设置失败: ' + err;
   }
 });
 

@@ -11,6 +11,8 @@ pub mod subtitle;
 pub mod sync;
 pub mod translate;
 mod bins;
+#[cfg(windows)]
+mod explorer_menu;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -27,6 +29,8 @@ pub struct AppState {
     current_video: Mutex<Option<u64>>,
     /// 学习面板抽屉开合（Phase C 单窗口；视频区随它收窄/恢复）
     drawer_open: Mutex<bool>,
+    /// 启动参数带入的视频路径（资源管理器右键"用 loopSub 播放"），前端消费一次即清
+    pending_video: Mutex<Option<String>>,
 }
 
 /// 单窗口布局常量（Phase C，Windows）：顶栏高 / 抽屉宽（逻辑像素）
@@ -93,6 +97,39 @@ fn set_drawer(
         let _ = app.run_on_main_thread(move || relayout_video(&app2));
     }
     Ok(())
+}
+
+/// 启动参数带入的视频路径（右键"用 loopSub 播放"）：取出一次即消费
+#[tauri::command]
+fn take_startup_video(state: tauri::State<'_, AppState>) -> Option<String> {
+    state.pending_video.lock().unwrap().take()
+}
+
+/// 资源管理器右键菜单状态（注册表即真相；非 Windows 恒 false）
+#[tauri::command]
+fn get_explorer_menu() -> bool {
+    #[cfg(windows)]
+    return explorer_menu::is_registered();
+    #[cfg(not(windows))]
+    return false;
+}
+
+/// 注册/移除资源管理器右键菜单（"用 loopSub 播放"；非 Windows 无操作）
+#[tauri::command]
+fn set_explorer_menu(enable: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if enable {
+            explorer_menu::register()
+        } else {
+            explorer_menu::unregister()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enable;
+        Ok(())
+    }
 }
 
 /// 前端就绪（DOMContentLoaded）：WebView2 初始化完成后抬顶+重排视频子窗口
@@ -986,6 +1023,10 @@ pub fn run() {
         .join("loopsub")
         .join("settings.json");
     let settings = Settings::load(&settings_path).unwrap_or_default();
+    // 右键菜单/命令行传入的视频路径：只认真实存在的文件，其余参数一律忽略
+    let pending_video = std::env::args()
+        .nth(1)
+        .filter(|p| PathBuf::from(p).is_file());
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1115,6 +1156,7 @@ pub fn run() {
             mpv: tokio::sync::Mutex::new(None),
             current_video: Mutex::new(None),
             drawer_open: Mutex::new(false),
+            pending_video: Mutex::new(pending_video),
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
@@ -1141,6 +1183,9 @@ pub fn run() {
             window_mode,
             set_drawer,
             webview_ready,
+            take_startup_video,
+            get_explorer_menu,
+            set_explorer_menu,
         ])
         .build(tauri::generate_context!())
         .expect("error while building loopSub");
