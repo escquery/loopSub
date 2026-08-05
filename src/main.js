@@ -27,6 +27,13 @@ const state = {
   delayStep: 0.1,
 };
 
+// 禁用 WebView2 默认右键菜单（播放器 UI 不应露浏览器菜单）；输入框保留编辑菜单
+//（后续若在字幕单词上加自定义右键功能，在这里放行或接管）
+document.addEventListener('contextmenu', (e) => {
+  if (e.target.closest('input, textarea, [contenteditable]')) return;
+  e.preventDefault();
+});
+
 const $ = (sel) => document.querySelector(sel);
 const listEl = $('#sentence-list');
 const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -120,11 +127,10 @@ async function refreshHistory() {
   } catch {
     return;
   }
-  $('#history-label').textContent = state.videoPath
-    ? state.videoPath.split(/[\\/]/).pop()
-    : entries.length
-      ? '最近播放'
-      : '暂无播放记录';
+  // 当前文件名移到历史面板头部（顶栏历史入口已图标按钮化）
+  $('#history-panel .panel-title').textContent = state.videoPath
+    ? `最近播放（当前：${state.videoPath.split(/[\\/]/).pop()}）`
+    : '最近播放';
   $('#history-list').innerHTML = entries
     .map(
       (e) =>
@@ -134,7 +140,7 @@ async function refreshHistory() {
 }
 
 // 历史记录为全铺面板（同搜索面板）：下拉浮层在单窗口形态会被 mpv 渲染层盖住
-$('#history-box').addEventListener('click', () => {
+$('#btn-history').addEventListener('click', () => {
   $('#history-panel').classList.toggle('hidden');
 });
 $('#btn-history-close').addEventListener('click', () => $('#history-panel').classList.add('hidden'));
@@ -741,7 +747,7 @@ async function initWindowMode() {
   bp.addEventListener('click', toggleDrawer);
   // 搜索/设置/历史的面板都在抽屉里：抽屉关着时点这些入口先自动开抽屉
   //（捕获阶段先执行，原处理逻辑照常走）
-  for (const sel of ['#history-box', '#btn-open-search', '#btn-settings']) {
+  for (const sel of ['#btn-history', '#btn-open-search', '#btn-settings']) {
     $(sel).addEventListener('click', () => { if (!drawerOpen) toggleDrawer(); }, true);
   }
   // 通知 Rust 侧 webview 已就绪：抬升并重排 mpv 子窗口

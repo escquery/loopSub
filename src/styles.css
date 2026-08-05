@@ -40,23 +40,7 @@ button:hover { border-color: var(--accent); }
 #top-bar { background: var(--bg-alt); }
 #conn-bar input, #load-bar input { flex: 1; min-width: 0; }
 
-/* 历史记录下拉（页面内渲染：原生 select 的弹出层是独立窗口，会被置顶的面板盖住） */
-#history-box {
-  flex: 1;
-  min-width: 0;
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
-  background: var(--bg);
-  border: 1px solid #3a3d44;
-  border-radius: 4px;
-  cursor: pointer;
-  user-select: none;
-}
-#history-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#history-arrow { color: var(--fg-dim); }
+/* 历史记录列表面板（入口为顶栏 🕘 图标按钮；页面内渲染：原生 select 弹出层会被盖住） */
 #history-list {
   flex: 1;
   overflow-y: auto;
