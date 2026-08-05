@@ -4,7 +4,8 @@
 //! 1. 设置页指定目录（用户显式配置，最高优先级）
 //! 2. PATH（用户自行安装）
 //! 3. 应用 resources 目录（随包携带）：
-//!    - Windows/Linux：exe 同目录的 `<name>` 或 `<name>/<name>` 子目录（mpv 是 exe+dll 文件夹）
+//!    - Windows/Linux：exe 同目录的 `<name>`、`<name>/<name>` 子目录（mpv 是 exe+dll 文件夹）、
+//!      以及 `resources/<name>`（tauri bundle.resources 的默认释放位置，安装版布局）
 //!    - macOS .app：Contents/Resources/ 下同名文件或同名子目录
 //! 都找不到时返回裸名字，让 spawn 错误信息自然暴露。
 
@@ -29,8 +30,13 @@ pub fn resolve(name: &str, configured_dir: Option<&Path>) -> PathBuf {
     // 3. 应用 resources 目录
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // Windows/Linux：exe 同目录；同名子目录（mpv 文件夹：mpv/mpv.exe + dll）
-            for p in [dir.join(&file_name), dir.join(name).join(&file_name)] {
+            // Windows/Linux：exe 同目录；同名子目录（mpv 文件夹：mpv/mpv.exe + dll）；
+            // resources 子目录（tauri bundle.resources 默认释放位置）
+            for p in [
+                dir.join(&file_name),
+                dir.join(name).join(&file_name),
+                dir.join("resources").join(&file_name),
+            ] {
                 if p.is_file() {
                     return p;
                 }

@@ -468,6 +468,7 @@ impl MpvEmbed {
 }
 
 /// 解析 libmpv 动态库：设置的外部程序目录 → exe 同目录 → exe/mpv 子目录
+/// → exe/resources 子目录（tauri bundle.resources 的默认释放位置，安装版布局）
 pub fn resolve_dll(settings_dir: Option<PathBuf>) -> Option<PathBuf> {
     #[cfg(windows)]
     const NAMES: [&str; 2] = ["libmpv-2.dll", "mpv-2.dll"];
@@ -481,6 +482,7 @@ pub fn resolve_dll(settings_dir: Option<PathBuf>) -> Option<PathBuf> {
         if let Some(dir) = exe.parent() {
             dirs.push(dir.to_path_buf());
             dirs.push(dir.join("mpv"));
+            dirs.push(dir.join("resources"));
         }
     }
     dirs.iter()
