@@ -12,3 +12,6 @@ dist
 # README.txt ä¸ºå ä½æ–‡ä»¶éœ€ä¿ç•™ï¼šbundle.resources çš„ "resources/*" glob è‡³å°‘è¦åŒ¹é…ä¸€ä¸ªæ–‡ä»¶
 /src-tauri/resources/*
 !/src-tauri/resources/README.txt
+
+# ±¾µØµ÷ÊÔ¹¤¾ß½Å±¾£¨¸±ÆÁÆô¶¯/´°¿ÚÌ½Õë/½ØÍ¼µÈ£©£¬½ö±¾»úÊ¹ÓÃ
+/tools/
