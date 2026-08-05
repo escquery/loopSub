@@ -253,8 +253,8 @@ pub fn default_hotkeys() -> HashMap<String, String> {
         ("ab_nudge_b_back", "ctrl+]"),
         ("ab_nudge_a_fwd", "alt+["),
         ("ab_nudge_b_fwd", "alt+]"),
-        ("ab_clear", "shift+["),
-        ("ab_clear_alt", "shift+]"),
+        ("ab_clear_a", "shift+["),
+        ("ab_clear_b", "shift+]"),
         ("sentence_loop", "Enter"),
         ("follow_mode", "r"),
         ("toggle_translation", "t"),
@@ -279,6 +279,13 @@ impl Settings {
         let content = std::fs::read_to_string(path)?;
         let mut settings: Settings =
             serde_json::from_str(&content).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // 迁移：ab_clear/ab_clear_alt 曾把 shift+[/] 当作“取消 AB 循环”的双键，
+        // 实为误读——两个键应分别取消 A/B 点（ab_clear_a/ab_clear_b）。
+        // 未改绑过的残留清掉，由下方补缺循环挂上新默认；ab_clear_alt 已废弃一律移除。
+        if settings.hotkeys.get("ab_clear").map(|s| s.as_str()) == Some("shift+[") {
+            settings.hotkeys.remove("ab_clear");
+        }
+        settings.hotkeys.remove("ab_clear_alt");
         // 老配置补挂新版本新增的默认热键（仅补缺项；设置页无解绑功能，不会误恢复）
         for (action, combo) in default_hotkeys() {
             settings.hotkeys.entry(action).or_insert(combo);
