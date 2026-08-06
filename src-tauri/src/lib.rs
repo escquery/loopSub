@@ -839,12 +839,21 @@ async fn recall_mpv(
 
 /// renderer 焦点恢复链（Windows）：切回窗口后 Chromium renderer 可能未聚焦
 ///（document.hasFocus=false，keydown 不进页面），而激活时序下立即 set_focus
-/// 会被忽略，故在 50/150/400ms 延迟点重试（set_focus → WebView2 MoveFocus，幂等）
+/// 会被忽略，故在 50/150/400ms 延迟点重试（set_focus → WebView2 MoveFocus，幂等）。
+/// 重试前必须比对代次：失焦会推进代次，迟到的重试若照常 set_focus 会把窗口
+/// 拉回前台、盖住用户刚激活的目标窗口（“A 浮上来了但 loopSub 马上弹回盖住”）
 #[cfg(windows)]
-fn spawn_focus_recovery(app: tauri::AppHandle) {
+fn spawn_focus_recovery(
+    app: tauri::AppHandle,
+    gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    expect: u64,
+) {
     tauri::async_runtime::spawn(async move {
         for delay in [50u64, 150, 400] {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            if gen.load(std::sync::atomic::Ordering::SeqCst) != expect {
+                return;
+            }
             let Some(w) = app.get_webview_window("main") else { return };
             let _ = w.set_focus();
         }
@@ -1072,9 +1081,30 @@ async fn export_anki_note(
     }
 }
 
+/// 置顶/取消置顶。取消置顶（失焦沉底）不能只靠 HWND_NOTOPMOST：它把窗口放到
+/// 所有非 topmost 窗口之上，而用户点击激活的目标窗口已被同步 raise——异步
+/// blur 链（事件→JS→invoke→Rust）后到的 NOTOPMOST 会把本窗口重新压到目标
+/// 窗口上方，表现为“点下面的窗口获焦却浮不上来”。故取消置顶后再压一步：
+/// 插到当前前台窗口正下方（fg 为 topmost 时落在 topmost 区紧下方，同样正确）。
 #[tauri::command]
 fn set_always_on_top(window: tauri::Window, flag: bool) -> Result<(), String> {
-    window.set_always_on_top(flag).map_err(|e| e.to_string())
+    window.set_always_on_top(flag).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    if !flag {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        };
+        // tauri 的 hwnd() 返回 windows crate 的 HWND 包装结构，取 .0 内部指针
+        let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as _;
+        unsafe {
+            let fg = GetForegroundWindow();
+            // 无前台窗口（锁屏/UAC 等）或前台即自己：退化为普通 NOTOPMOST（已完成）
+            if !fg.is_null() && fg != hwnd {
+                SetWindowPos(hwnd, fg, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 原生文件对话框选视频（Rust 侧调起，前端无需 dialog 插件权限）
@@ -1136,6 +1166,9 @@ pub fn run() {
             // webview 窗口；面板没了，视频窗口就成了没有控制端的孤儿（进程也不退）
             if let Some(main_win) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
+                // 焦点恢复重试链的代次计数：Focused(true/false) 都推进；迟到的重试
+                // 发现代次已变（用户已切走）即放弃，防把窗口拉回前台盖住目标窗口
+                let focus_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 main_win.on_window_event(move |event| {
                     match event {
                         tauri::WindowEvent::Destroyed => {
@@ -1162,7 +1195,14 @@ pub fn run() {
                                 let _ = w.set_focus();
                             }
                             #[cfg(windows)]
-                            spawn_focus_recovery(app_handle.clone());
+                            {
+                                let expect = focus_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                                spawn_focus_recovery(app_handle.clone(), focus_gen.clone(), expect);
+                            }
+                        }
+                        // 失焦推进代次：作废尚未执行的恢复重试
+                        tauri::WindowEvent::Focused(false) => {
+                            focus_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         _ => {}
                     }

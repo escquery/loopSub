@@ -515,6 +515,14 @@ function clearAB() {
 async function setABPoint(which) {
   const pos = await mpv('get_property', 'time-pos');
   if (typeof pos !== 'number') return;
+  // 顺序校验：mpv 仅在 a < b 时循环，反序设置静默不生效（OSD 照提示，
+  // 表现为“按了没用、再按一次又好了”——实为回退播放后 B 落在 A 前）。
+  // 反序时拒绝设置并明示，另一端未设时读取报错 catch 为 null（反序流可设）
+  const other = await mpv('get_property', `ab-loop-${which === 'a' ? 'b' : 'a'}`).catch(() => null);
+  if (typeof other === 'number') {
+    if (which === 'b' && pos <= other) return osd(`B 点须在 A 点（${other.toFixed(1)}s）之后`);
+    if (which === 'a' && pos >= other) return osd(`A 点须在 B 点（${other.toFixed(1)}s）之前`);
+  }
   await mpv('set_property', `ab-loop-${which}`, pos);
   osd(`${which.toUpperCase()}: ${pos.toFixed(1)}s`);
 }
