@@ -37,8 +37,80 @@ button:hover { border-color: var(--accent); }
   padding: 6px 8px;
   align-items: center;
 }
-#top-bar { background: var(--bg-alt); }
+#top-bar { position: relative; background: var(--bg-alt); }
 #conn-bar input, #load-bar input { flex: 1; min-width: 0; }
+
+/* 视频加载状态占满顶栏：Windows 的视频画面是原生子窗口，DOM 浮层放在画面
+   区会被盖住；顶栏位于视频 HWND 之外，因此首次导出字幕时始终可见。 */
+body.video-loading #top-bar { display: flex !important; }
+#video-load-indicator {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 0 16px;
+  overflow: hidden;
+  background: rgba(28, 31, 36, 0.97);
+  color: #d9eaff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: wait;
+}
+#video-load-indicator::after {
+  content: "";
+  position: absolute;
+  left: -35%;
+  bottom: 0;
+  width: 35%;
+  height: 3px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: load-sweep 1.25s ease-in-out infinite;
+}
+#video-load-indicator.error {
+  color: #ffd5d5;
+  background: rgba(77, 30, 30, 0.97);
+  cursor: default;
+}
+#video-load-indicator.error::after { display: none; }
+#video-load-indicator.error .load-spinner { display: none; }
+.load-spinner {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  border: 2px solid rgba(255, 255, 255, 0.24);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: load-spin 0.75s linear infinite;
+}
+#video-load-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@keyframes load-spin { to { transform: rotate(360deg); } }
+@keyframes load-sweep { from { left: -35%; } to { left: 100%; } }
+
+/* 底部进度条同步显示不定进度；即使用户视线停在画面上也能感知仍在工作。 */
+body.video-loading.single #progress-fill {
+  width: 100% !important;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  background-size: 35% 100%;
+  background-repeat: no-repeat;
+  animation: load-progress-sweep 1.25s ease-in-out infinite;
+}
+@keyframes load-progress-sweep {
+  from { background-position-x: -55%; }
+  to { background-position-x: 155%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .load-spinner,
+  #video-load-indicator::after,
+  body.video-loading.single #progress-fill { animation: none; }
+}
 
 /* 历史记录列表面板（入口为顶栏 🕘 图标按钮；页面内渲染：原生 select 弹出层会被盖住） */
 #history-list {

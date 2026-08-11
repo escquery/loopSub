@@ -69,10 +69,47 @@ function showNotice(html) {
   if (singleMode) osd(bar.textContent.trim());
 }
 
+// 顶栏加载提示：顶栏不与原生 mpv 视频 HWND 重叠，所以抽屉关闭、首次尚未
+// 启动 mpv、或切换视频时都能看到。错误保留数秒，避免失败信息也藏在抽屉里。
+let videoLoadStatusTimer = null;
+function showVideoLoadStatus(text, error = false) {
+  if (videoLoadStatusTimer) {
+    clearTimeout(videoLoadStatusTimer);
+    videoLoadStatusTimer = null;
+  }
+  const indicator = $('#video-load-indicator');
+  const label = $('#video-load-text');
+  label.textContent = String(text);
+  label.title = String(text);
+  indicator.classList.toggle('error', error);
+  indicator.classList.remove('hidden');
+  document.body.classList.toggle('video-loading', !error);
+  if (error) {
+    videoLoadStatusTimer = setTimeout(hideVideoLoadStatus, 6000);
+  }
+}
+
+function hideVideoLoadStatus() {
+  if (videoLoadStatusTimer) {
+    clearTimeout(videoLoadStatusTimer);
+    videoLoadStatusTimer = null;
+  }
+  $('#video-load-indicator').classList.add('hidden');
+  $('#video-load-indicator').classList.remove('error');
+  document.body.classList.remove('video-loading');
+}
+
+$('#video-load-indicator').addEventListener('click', () => {
+  if ($('#video-load-indicator').classList.contains('error')) hideVideoLoadStatus();
+});
+
 // ---------- 视频 / 字幕加载 ----------
 async function loadVideo(path) {
   if (state.loading) return; // 加载中，防止重复触发
   state.loading = true;
+  let failed = false;
+  const fileName = path.split(/[\\/]/).pop() || path;
+  showVideoLoadStatus(`正在打开 ${fileName}…`);
   showNotice('<span class="dim">正在打开视频…</span>');
   try {
     const res = await invoke('load_video', { path });
@@ -97,8 +134,12 @@ async function loadVideo(path) {
     }
     if (res.resume_s >= 5) osd(`已从 ${fmtTime(res.resume_s * 1000)} 续播`);
   } catch (e) {
-    showNotice('加载视频失败: ' + esc(String(e)));
+    failed = true;
+    const message = '加载视频失败: ' + String(e);
+    showNotice(esc(message));
+    showVideoLoadStatus(message, true);
   } finally {
+    if (!failed) hideVideoLoadStatus();
     state.loading = false;
     refreshHistory();
   }
@@ -116,7 +157,9 @@ $('#btn-browse').addEventListener('click', async () => {
 
 // 后端分阶段推送加载进度（探测/提取字幕/启动播放器），首次打开不再“卡死”
 listen('video-load-progress', (e) => {
-  showNotice(`<span class="dim">${esc(String(e.payload))}</span>`);
+  const message = String(e.payload);
+  showNotice(`<span class="dim">${esc(message)}</span>`);
+  if (state.loading) showVideoLoadStatus(message);
 });
 
 // 历史记录下拉（页面内渲染，原生 select 弹出层会被置顶面板盖住）
@@ -513,10 +556,12 @@ function clearAB() {
 }
 
 async function setABPoint(which) {
-  const pos = await mpv('get_property', 'time-pos');
-  if (typeof pos !== 'number') return;
-  // 顺序校验：mpv 仅在 a < b 时循环，反序设置静默不生效（OSD 照提示，
-  // 表现为“按了没用、再按一次又好了”——实为回退播放后 B 落在 A 前）。
+  // time-pos 在 seek/加载落地前的极短窗口内不可用：原实现静默 return 无提示，
+  // 用户以为设上了（尤其 A 端），随后 B 设了也不循环——“第一次失效、
+  // 第二次必成功”的头号嫌疑。此处必须发声。
+  const pos = await mpv('get_property', 'time-pos').catch(() => null);
+  if (typeof pos !== 'number') return osd('播放位置未就绪，请再按一次');
+  // 顺序校验：mpv 仅在 a < b 时循环，反序设置静默不生效。
   // 反序时拒绝设置并明示，另一端未设时读取报错 catch 为 null（反序流可设）
   const other = await mpv('get_property', `ab-loop-${which === 'a' ? 'b' : 'a'}`).catch(() => null);
   if (typeof other === 'number') {
@@ -524,7 +569,52 @@ async function setABPoint(which) {
     if (which === 'a' && pos >= other) return osd(`A 点须在 B 点（${other.toFixed(1)}s）之前`);
   }
   await mpv('set_property', `ab-loop-${which}`, pos);
-  osd(`${which.toUpperCase()}: ${pos.toFixed(1)}s`);
+  // 回读两端实际值并报告循环激活状态：mpv 仅在 a、b 皆设且 a<b 时循环。
+  // “设了没循环”时此提示直接暴露原因（另一端未设/被清），不再靠猜。
+  const [ra, rb] = await Promise.all([
+    mpv('get_property', 'ab-loop-a').catch(() => null),
+    mpv('get_property', 'ab-loop-b').catch(() => null),
+  ]);
+  const fmt = (v) => (typeof v === 'number' ? v.toFixed(1) : '—');
+  const active = typeof ra === 'number' && typeof rb === 'number' && ra < rb;
+  osd(`${which.toUpperCase()}: ${pos.toFixed(1)}s｜A:${fmt(ra)} B:${fmt(rb)}${active ? '' : '（未循环）'}`);
+  if (active) watchABLoop(ra, rb);
+}
+
+// AB 循环激活监视（诊断+自愈）：实测存在“a<b 已写入、回读正常，但播放越过 b
+// 不回跳”的失效态（用户再按一次 ] 重写同值即恢复，根因未明，疑似 mpv 内部
+// 循环激活时序）。设点后轮询：播放自然越过 b 未回跳 → 以当前位置重写 b
+//（等价用户再按 ]，实测必恢复），OSD 保留现场值供排查。
+// 三类退出：回跳到 a 附近（循环工作）；pos 跳变 >1s（用户主动 seek 离开——
+// mpv 手册明确“seek 越过 b 不循环”是故意行为，不得自愈改写）；60s 超时。
+let abWatchTimer = null;
+function watchABLoop(a, b) {
+  if (abWatchTimer) clearInterval(abWatchTimer);
+  const started = Date.now();
+  let lastPos = null;
+  abWatchTimer = setInterval(async () => {
+    if (Date.now() - started > 60000) { clearInterval(abWatchTimer); abWatchTimer = null; return; }
+    const pos = await mpv('get_property', 'time-pos').catch(() => null);
+    if (typeof pos !== 'number') return;
+    // 回跳过 b 以下 0.6s：循环在正常工作
+    if (pos < b - 0.6) { clearInterval(abWatchTimer); abWatchTimer = null; return; }
+    // 采样间跳变 >1s 视为 seek（正常播放前进 ≤0.25s×3 倍速）：用户主动离开，停止监视
+    const jumped = lastPos !== null && Math.abs(pos - lastPos) > 1.0;
+    lastPos = pos;
+    if (jumped) { clearInterval(abWatchTimer); abWatchTimer = null; return; }
+    // 播放自然越过 b 仍未回跳 → 失效态。确认 a/b 未被用户改动后自愈重写 b
+    if (pos > b + 0.8) {
+      clearInterval(abWatchTimer); abWatchTimer = null;
+      const [ra, rb] = await Promise.all([
+        mpv('get_property', 'ab-loop-a').catch(() => null),
+        mpv('get_property', 'ab-loop-b').catch(() => null),
+      ]);
+      if (typeof ra === 'number' && typeof rb === 'number' && Math.abs(rb - b) < 0.05 && ra < rb) {
+        await mpv('set_property', 'ab-loop-b', pos);
+        osd(`AB 未激活已重设B（现场 a=${ra.toFixed(1)} b=${rb.toFixed(1)} pos=${pos.toFixed(1)}）`);
+      }
+    }
+  }, 250);
 }
 
 async function nudgeABPoint(which, delta) {
@@ -739,14 +829,22 @@ async function fitVideoWindow() {
 }
 
 // ---------- 窗口行为：失焦沉底 / 切回召回 mpv ----------
+// 必须在异步注册 focus listener 前初始化，避免监听刚装好就回调时落入 TDZ。
+let singleMode = false;
+let drawerOpen = false;
 let blurredAt = 0;
 listen('tauri://blur', () => {
   blurredAt = Date.now();
-  if (state.settings?.window?.sink_on_blur) {
+  // Windows 单窗口从不置顶，也不要在失焦后反复下发 NOTOPMOST；后者会改变
+  // 普通窗口的 Z 序，造成 Alt+Tab 已转移焦点但 loopSub 偶尔仍压在上面。
+  if (!singleMode && state.settings?.window?.sink_on_blur) {
     invoke('set_always_on_top', { flag: false }).catch(() => {});
   }
 });
 listen('tauri://focus', () => {
+  // Windows 已是视频内嵌的单顶层窗口，系统激活本身就会正常置前；沿用旧版
+  // “悬浮面板”策略设为 topmost，会破坏 Alt+Tab 的标准 Z 序行为。
+  if (singleMode) return;
   if (!state.settings?.window?.recall_mpv_on_focus) return;
   if (Date.now() - blurredAt < 2000) return; // 短暂离开不召回
   invoke('set_always_on_top', { flag: true }).catch(() => {});
@@ -754,9 +852,6 @@ listen('tauri://focus', () => {
 });
 
 // ---------- 单窗口模式（Windows：mpv 画面内嵌主窗口，学习面板收进右侧抽屉） ----------
-let singleMode = false;
-let drawerOpen = false;
-
 function toggleDrawer() {
   drawerOpen = !drawerOpen;
   $('#drawer').classList.toggle('hidden', !drawerOpen);
@@ -769,6 +864,9 @@ async function initWindowMode() {
     singleMode = (await invoke('window_mode')) === 'single';
   } catch { return; }
   if (!singleMode) return;
+  // 单窗口模式不需要悬浮面板的自动置顶；启动时也主动清掉可能由早到的
+  // focus 事件或旧逻辑留下的 topmost 状态，保证鼠标与 Alt+Tab 行为一致。
+  invoke('set_always_on_top', { flag: false }).catch(() => {});
   document.body.classList.add('single');
   // 面板元素搬入右侧抽屉（事件绑在元素上，搬移后保留）；通知条进抽屉顶部
   const drawer = $('#drawer');

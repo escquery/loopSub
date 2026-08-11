@@ -81,7 +81,7 @@ mpv --idle=yes --force-window \
 | 译文显隐 | `secondary-sid` 切换（mpv 渲染模式下） |
 | 字幕延迟微调 | `sub-delay` / `secondary-sub-delay`（双轨默认联动） |
 | 瞬态反馈 | `show-text "..." 1000` 显示在视频画面上 |
-| 对白增强 | `set af dynaudnorm`（运行时热切换） |
+| 对白增强 | `lavfi` 短时固定参数压缩器 + 峰值限制（避免 AB 循环增益漂移） |
 | 状态同步 | 订阅 `pause` / `time-pos` / `duration` / `eof-reached` / `sub-start` / `sub-end` |
 
 **当前句判定不依赖 mpv**：订阅 `time-pos` 在程序自己的句子表里反查
@@ -200,7 +200,7 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| 对白增强 `dynaudnorm` | 开 | 动态范围压缩，解决美剧对白偏轻；运行时热切换 |
+| 对白增强（短时压缩 + limiter） | 开 | 固定参数压缩并补偿增益，不使用会跨 AB 循环学习响度的 dynaudnorm |
 | 音量上限 | 关闭 | 可选 150%/200%（`volume-max`） |
 | 中置声道提升 | 关（进阶） | 5.1 片源 `pan` 滤镜加权 FC 进立体声 |
 

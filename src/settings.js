@@ -103,7 +103,7 @@ const SettingsUI = {
       </section>
       <section>
         <h3>音频</h3>
-        <label class="row"><input type="checkbox" data-k="audio.dialogue_boost" ${s.audio.dialogue_boost ? 'checked' : ''} /> 对白增强（动态范围压缩）</label>
+        <label class="row"><input type="checkbox" data-k="audio.dialogue_boost" ${s.audio.dialogue_boost ? 'checked' : ''} /> 对白增强（稳定短时压缩）</label>
         <label>音量上限 %（0 = 不限制）<input type="number" data-k="audio.volume_max" value="${s.audio.volume_max ?? 0}" /></label>
       </section>
       <section>

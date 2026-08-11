@@ -43,6 +43,12 @@ const PROGRESS_H: f64 = 14.0;
 #[cfg(windows)]
 const DRAWER_W: f64 = 420.0;
 
+/// 对白增强使用短时固定参数压缩器，而不是 dynaudnorm。后者默认会在十几秒
+/// 窗口内持续学习响度，AB 回跳不会重置这段历史，因此同一句每轮增益都可能不同。
+/// acompressor 只保留 180ms 的释放状态：压低峰值后固定补偿约 +9.5dB；limiter
+/// 仅负责兜住瞬态峰值，避免削波。参数不随已播放内容学习，循环响度可重复。
+const DIALOGUE_BOOST_AF: &str = "lavfi=[acompressor=threshold=0.125:ratio=3:attack=15:release=180:makeup=3:knee=2.828:detection=rms,alimiter=limit=0.95:attack=5:release=50:level=false]";
+
 /// 重排视频子窗口：顶栏以下、抽屉以左的区域（顺带抬顶——WebView2 异步初始化
 /// 会把自己的子窗口压在 mpv 子窗口上面）。非嵌入形态（降级/顶层窗口）无操作。
 #[cfg(windows)]
@@ -396,7 +402,9 @@ async fn mpv_start_internal(state: &AppState, app: &tauri::AppHandle) -> Result<
 
     let audio = state.audio();
     if audio.dialogue_boost {
-        let _ = m.set_property("af", "dynaudnorm".into()).await;
+        m.set_property("af", DIALOGUE_BOOST_AF.into())
+            .await
+            .map_err(|e| format!("启用对白增强失败: {e}"))?;
     }
     if let Some(vm) = audio.volume_max {
         let _ = m.set_property("volume-max", vm.into()).await;
@@ -489,7 +497,7 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
     let source = if original.exists() {
         "cache"
     } else {
-        let _ = app.emit("video-load-progress", "正在探测字幕轨…");
+        let _ = app.emit("video-load-progress", "正在检测视频中的字幕轨…");
         let v = video.clone();
         let ffprobe = state.bin("ffprobe");
         let tracks = tokio::task::spawn_blocking(move || media::probe_subtitles(&v, &ffprobe))
@@ -497,7 +505,10 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
         let extracted = if let Some(track) = media::pick_text_track(&tracks) {
-            let _ = app.emit("video-load-progress", "正在提取内嵌字幕（首次打开较慢）…");
+            let _ = app.emit(
+                "video-load-progress",
+                "正在导出内嵌字幕，首次打开可能需要一些时间…",
+            );
             let v = video.clone();
             let out = original.clone();
             let ffmpeg = state.bin("ffmpeg");
@@ -533,7 +544,7 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
     }
 
     // 拉起 mpv 并播放（无字幕也先播，等用户搜索）；面板渲染模式下关掉 mpv 自带字幕
-    let _ = app.emit("video-load-progress", "正在启动播放器…");
+    let _ = app.emit("video-load-progress", "字幕准备完成，正在启动播放器…");
     mpv_start_internal(&state, &app).await?;
     {
         let guard = state.mpv.lock().await;
@@ -832,32 +843,29 @@ async fn recall_mpv(
         return Err("mpv 未在播放（手动连接模式不支持召回）".into());
     }
     let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
-    let _ = win.unminimize();
-    let _ = win.show();
-    win.set_focus().map_err(|e| e.to_string())
-}
-
-/// renderer 焦点恢复链（Windows）：切回窗口后 Chromium renderer 可能未聚焦
-///（document.hasFocus=false，keydown 不进页面），而激活时序下立即 set_focus
-/// 会被忽略，故在 50/150/400ms 延迟点重试（set_focus → WebView2 MoveFocus，幂等）。
-/// 重试前必须比对代次：失焦会推进代次，迟到的重试若照常 set_focus 会把窗口
-/// 拉回前台、盖住用户刚激活的目标窗口（“A 浮上来了但 loopSub 马上弹回盖住”）
-#[cfg(windows)]
-fn spawn_focus_recovery(
-    app: tauri::AppHandle,
-    gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    expect: u64,
-) {
-    tauri::async_runtime::spawn(async move {
-        for delay in [50u64, 150, 400] {
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            if gen.load(std::sync::atomic::Ordering::SeqCst) != expect {
+    #[cfg(windows)]
+    {
+        // recall_mpv 是 async 命令：等 mpv 锁期间用户可能已经切走。真正执行
+        // 召回前必须在主线程重验前台窗口，否则迟到的 set_focus 会抢回焦点。
+        app.run_on_main_thread(move || {
+            use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+            let Ok(hwnd) = win.hwnd() else { return };
+            if unsafe { GetForegroundWindow() } != hwnd.0 as _ {
                 return;
             }
-            let Some(w) = app.get_webview_window("main") else { return };
-            let _ = w.set_focus();
-        }
-    });
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+        })
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = win.unminimize();
+        let _ = win.show();
+        win.set_focus().map_err(|e| e.to_string())
+    }
 }
 
 // ---------- 字幕自动对齐 ----------
@@ -1081,30 +1089,41 @@ async fn export_anki_note(
     }
 }
 
-/// 置顶/取消置顶。取消置顶（失焦沉底）不能只靠 HWND_NOTOPMOST：它把窗口放到
-/// 所有非 topmost 窗口之上，而用户点击激活的目标窗口已被同步 raise——异步
-/// blur 链（事件→JS→invoke→Rust）后到的 NOTOPMOST 会把本窗口重新压到目标
-/// 窗口上方，表现为“点下面的窗口获焦却浮不上来”。故取消置顶后再压一步：
-/// 插到当前前台窗口正下方（fg 为 topmost 时落在 topmost 区紧下方，同样正确）。
+/// 旧版独立悬浮面板需要动态置顶；Windows 现为单顶层窗口，必须完全交给系统
+/// 管理 Z 序。尤其不能在 blur 后重复 HWND_NOTOPMOST：它会把普通窗口重新放到
+/// 非 topmost 队列顶端，正是鼠标/Alt+Tab 偶发“焦点已走但窗口仍在上面”的来源。
 #[tauri::command]
 fn set_always_on_top(window: tauri::Window, flag: bool) -> Result<(), String> {
-    window.set_always_on_top(flag).map_err(|e| e.to_string())?;
     #[cfg(windows)]
-    if !flag {
+    {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            GetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
         };
-        // tauri 的 hwnd() 返回 windows crate 的 HWND 包装结构，取 .0 内部指针
+        let _ = flag; // Windows 单窗口模式永不进入 topmost 队列
         let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as _;
-        unsafe {
-            let fg = GetForegroundWindow();
-            // 无前台窗口（锁屏/UAC 等）或前台即自己：退化为普通 NOTOPMOST（已完成）
-            if !fg.is_null() && fg != hwnd {
-                SetWindowPos(hwnd, fg, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // 正常情况下配置从未置顶，这里完全不碰 Z 序；只清理由旧版本或外部
+        // 工具遗留的真实 WS_EX_TOPMOST，避免 NOTOPMOST 对普通窗口产生一次 raise。
+        let exstyle = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        if exstyle & (WS_EX_TOPMOST as isize) != 0 {
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
             }
         }
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        window.set_always_on_top(flag).map_err(|e| e.to_string())
+    }
 }
 
 /// 原生文件对话框选视频（Rust 侧调起，前端无需 dialog 插件权限）
@@ -1112,6 +1131,11 @@ fn set_always_on_top(window: tauri::Window, flag: bool) -> Result<(), String> {
 #[tauri::command]
 async fn pick_video(window: tauri::Window) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
+    // Windows 单窗口永不置顶；不要读取/恢复 Tauri 可能因旧版热重载残留的
+    // 内部 topmost 状态，否则关闭对话框时会把已清掉的置顶重新打开。
+    #[cfg(windows)]
+    let was_top = false;
+    #[cfg(not(windows))]
     let was_top = window.is_always_on_top().unwrap_or(false);
     if was_top {
         let _ = window.set_always_on_top(false);
@@ -1166,9 +1190,6 @@ pub fn run() {
             // webview 窗口；面板没了，视频窗口就成了没有控制端的孤儿（进程也不退）
             if let Some(main_win) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
-                // 焦点恢复重试链的代次计数：Focused(true/false) 都推进；迟到的重试
-                // 发现代次已变（用户已切走）即放弃，防把窗口拉回前台盖住目标窗口
-                let focus_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 main_win.on_window_event(move |event| {
                     match event {
                         tauri::WindowEvent::Destroyed => {
@@ -1187,32 +1208,13 @@ pub fn run() {
                         // 拉伸重排视频子窗口（顶栏以下、抽屉以左）
                         #[cfg(windows)]
                         tauri::WindowEvent::Resized(_) => relayout_video(&app_handle),
-                        // 切回窗口后把键盘焦点交还 WebView2：失焦再激活后 Chromium
-                        // 内部焦点不自动恢复（页面快捷键全失效）；激活时序下立即
-                        // MoveFocus 会被忽略，走延迟重试链恢复
-                        tauri::WindowEvent::Focused(true) => {
-                            if let Some(w) = app_handle.get_webview_window("main") {
-                                let _ = w.set_focus();
-                            }
-                            #[cfg(windows)]
-                            {
-                                let expect = focus_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                                spawn_focus_recovery(app_handle.clone(), focus_gen.clone(), expect);
-                            }
-                        }
-                        // 失焦推进代次：作废尚未执行的恢复重试
-                        tauri::WindowEvent::Focused(false) => {
-                            focus_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        }
                         _ => {}
                     }
                 });
             }
-            // 焦点看门狗（Windows）：鼠标点视频画面激活主窗口时，系统会把键盘
-            // 焦点恢复给“上次持焦的子窗口”——纯显示的视频窗口，MoveFocus 与
-            // WM_MOUSEACTIVATE 拦截都压不住这个时序。轮询发现焦点落在视频窗口
-            // 上（loopsub-video 无输入绑定，持焦必是异常）就投递主线程抢回
-            // WebView2；与 mpv 子类化/消息时序完全无关。主窗口销毁后线程退出。
+            // 视频渲染子窗口样式看门狗（Windows）：mpv 会异步创建内部子窗口，
+            // 定期补上禁用与命中穿透。这里只处理子窗口样式，绝不调用 set_focus
+            // 或调整主窗口 Z 序；鼠标与 Alt+Tab 全部交给 Windows 正常处理。
             #[cfg(windows)]
             {
                 use windows_sys::Win32::Foundation::HWND;
@@ -1251,41 +1253,6 @@ pub fn run() {
                             }
                         }
                     }
-                    // GetFocus 只对调用线程队列有效，必须经 GUIThreadInfo 看主线程
-                    let tid = unsafe { GetWindowThreadProcessId(main, std::ptr::null_mut()) };
-                    let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
-                    info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
-                    if unsafe { GetGUIThreadInfo(tid, &mut info) } == 0 {
-                        continue;
-                    }
-                    let mut buf = [0u16; 64];
-                    let n = if info.hwndFocus.is_null() {
-                        0
-                    } else {
-                        unsafe { GetClassNameW(info.hwndFocus, buf.as_mut_ptr(), buf.len() as i32) }
-                    };
-                    let name = if n > 0 { String::from_utf16_lossy(&buf[..n as usize]) } else { String::new() };
-                    if info.hwndActive != main || info.hwndFocus.is_null() {
-                        continue; // 主窗口非激活/无人持焦：不管
-                    }
-                    if name.is_empty() {
-                        continue;
-                    }
-                    // 白名单：焦点在 wry 容器及其下的 WebView2/Chromium 窗口即正常；
-                    // 其余（主窗口框架、loopsub-video 纯显示层等）DOM 都收不到键盘，
-                    // 一律抢回。放宽原因：激活时系统恢复的焦点目标并不固定。
-                    let normal = name.starts_with("WRY_WEBVIEW")
-                        || name.starts_with("Chrome_WidgetWin")
-                        || name.starts_with("Windows.UI.Core.CoreWindow");
-                    if normal {
-                        continue;
-                    }
-                    let wh = app_handle.clone();
-                    let _ = app_handle.run_on_main_thread(move || {
-                        if let Some(w) = wh.get_webview_window("main") {
-                            let _ = w.set_focus();
-                        }
-                    });
                     }
                 });
             }
