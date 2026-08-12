@@ -426,6 +426,17 @@ function syncSelectionUI() {
   });
 }
 
+// 句子底纹表示程序的数据选区（V / Ctrl+点击 / Shift+点击），与浏览器拖蓝的
+// 原生文字选区是两套状态。用户开始拖选文字时清掉旧的数据选区，避免画面上
+// 同时出现“268 有底纹、270 文字被拖蓝”却在 Ctrl+C 时优先复制 268 的歧义。
+listEl.addEventListener('mousedown', (e) => {
+  if (!e.target.closest('.text') || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (state.selected.size === 0) return;
+  state.selected.clear();
+  state.lastClickIdx = -1;
+  syncSelectionUI();
+});
+
 function seekToLine(idx) {
   const l = state.lines[idx];
   if (!l) return;
@@ -577,44 +588,16 @@ async function setABPoint(which) {
   ]);
   const fmt = (v) => (typeof v === 'number' ? v.toFixed(1) : '—');
   const active = typeof ra === 'number' && typeof rb === 'number' && ra < rb;
-  osd(`${which.toUpperCase()}: ${pos.toFixed(1)}s｜A:${fmt(ra)} B:${fmt(rb)}${active ? '' : '（未循环）'}`);
-  if (active) watchABLoop(ra, rb);
-}
 
-// AB 循环激活监视（诊断+自愈）：实测存在“a<b 已写入、回读正常，但播放越过 b
-// 不回跳”的失效态（用户再按一次 ] 重写同值即恢复，根因未明，疑似 mpv 内部
-// 循环激活时序）。设点后轮询：播放自然越过 b 未回跳 → 以当前位置重写 b
-//（等价用户再按 ]，实测必恢复），OSD 保留现场值供排查。
-// 三类退出：回跳到 a 附近（循环工作）；pos 跳变 >1s（用户主动 seek 离开——
-// mpv 手册明确“seek 越过 b 不循环”是故意行为，不得自愈改写）；60s 超时。
-let abWatchTimer = null;
-function watchABLoop(a, b) {
-  if (abWatchTimer) clearInterval(abWatchTimer);
-  const started = Date.now();
-  let lastPos = null;
-  abWatchTimer = setInterval(async () => {
-    if (Date.now() - started > 60000) { clearInterval(abWatchTimer); abWatchTimer = null; return; }
-    const pos = await mpv('get_property', 'time-pos').catch(() => null);
-    if (typeof pos !== 'number') return;
-    // 回跳过 b 以下 0.6s：循环在正常工作
-    if (pos < b - 0.6) { clearInterval(abWatchTimer); abWatchTimer = null; return; }
-    // 采样间跳变 >1s 视为 seek（正常播放前进 ≤0.25s×3 倍速）：用户主动离开，停止监视
-    const jumped = lastPos !== null && Math.abs(pos - lastPos) > 1.0;
-    lastPos = pos;
-    if (jumped) { clearInterval(abWatchTimer); abWatchTimer = null; return; }
-    // 播放自然越过 b 仍未回跳 → 失效态。确认 a/b 未被用户改动后自愈重写 b
-    if (pos > b + 0.8) {
-      clearInterval(abWatchTimer); abWatchTimer = null;
-      const [ra, rb] = await Promise.all([
-        mpv('get_property', 'ab-loop-a').catch(() => null),
-        mpv('get_property', 'ab-loop-b').catch(() => null),
-      ]);
-      if (typeof ra === 'number' && typeof rb === 'number' && Math.abs(rb - b) < 0.05 && ra < rb) {
-        await mpv('set_property', 'ab-loop-b', pos);
-        osd(`AB 未激活已重设B（现场 a=${ra.toFixed(1)} b=${rb.toFixed(1)} pos=${pos.toFixed(1)}）`);
-      }
-    }
-  }, 250);
+  // B 通常取自“当前播放位置”。从读取 time-pos 到属性真正写入之间画面仍在
+  // 前进，写完时播放头可能已经越过 B；mpv 不保证为这种“设置时已在界外”的
+  // 情况补发一次回跳。B 成功激活后明确跳到 A，首轮立即开始且行为确定。
+  // 旧版 250ms 监视器会等到越过 B+0.8s 后把 B 改成更晚的当前位置，正是
+  // 延迟约两秒并出现“AB 未激活已重设B”的原因，现已彻底移除。
+  if (active && which === 'b') {
+    await mpv('seek', ra, 'absolute+exact');
+  }
+  osd(`${which.toUpperCase()}: ${pos.toFixed(1)}s｜A:${fmt(ra)} B:${fmt(rb)}${active ? '' : '（未循环）'}`);
 }
 
 async function nudgeABPoint(which, delta) {
@@ -796,7 +779,19 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// ---------- 复制英文（从数据层序列化，绝不包含中文） ----------
+// ---------- 复制英文 ----------
+// 原生拖蓝文字的优先级最高：应复制用户眼前精确选中的字符，不套模板；仅当
+// 没有原生文字选区时，Ctrl+C 才序列化 V / Ctrl+点击选中的整句数据。
+function hasNativeTextSelection() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return false;
+  const range = sel.getRangeAt(0);
+  const container = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+    ? range.commonAncestorContainer
+    : range.commonAncestorContainer.parentElement;
+  return !!container?.closest?.('#sentence-list');
+}
+
 function copySelected() {
   if (state.selected.size === 0) return;
   const idxs = [...state.selected].sort((a, b) => a - b);
@@ -806,7 +801,8 @@ function copySelected() {
 }
 
 document.addEventListener('keydown', (e) => {
-  if (!(e.ctrlKey || e.metaKey) || e.key !== 'c') return;
+  if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 'c') return;
+  if (hasNativeTextSelection()) return; // 交给浏览器复制拖蓝的原文
   if (state.selected.size === 0) return;
   e.preventDefault();
   copySelected();
