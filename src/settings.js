@@ -47,7 +47,7 @@ const ACTION_LABELS = {
   follow_mode: '跟读模式',
   toggle_translation: '译文显隐',
   reveal_current_translation: '当前句译文显隐',
-  select_current: '选中当前句',
+  select_current: '选中 / 取消当前句',
   sub_delay_minus: '字幕延迟 −0.1s',
   sub_delay_plus: '字幕延迟 +0.1s',
   sub_delay_minus_coarse: '字幕延迟 −0.5s',

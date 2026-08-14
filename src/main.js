@@ -720,11 +720,14 @@ const actions = {
   toggle_translation: () => toggleZh(),
   reveal_current_translation: () => toggleCurrentZh(),
   select_current: () => {
-    if (state.currentIdx >= 0) {
-      state.selected.add(state.currentIdx);
-      syncSelectionUI();
-      osd(`已选中 #${state.lines[state.currentIdx].number}`);
-    }
+    if (state.currentIdx < 0) return;
+    const idx = state.currentIdx;
+    const number = state.lines[idx].number;
+    const selected = state.selected.has(idx);
+    selected ? state.selected.delete(idx) : state.selected.add(idx);
+    state.lastClickIdx = idx;
+    syncSelectionUI();
+    osd(selected ? `已取消 #${number}` : `已选中 #${number}`);
   },
   copy_current: () => {
     if (state.currentIdx < 0) return;
