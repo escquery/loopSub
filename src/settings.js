@@ -3,7 +3,7 @@
 'use strict';
 
 // 键盘事件 → 规范化组合键，与 Rust 默认表格式一致：
-// 修饰键顺序 ctrl → alt → shift；单字符小写；空格记为 Space；
+// 修饰键顺序 ctrl → alt → shift → meta；单字符小写；空格记为 Space；
 // Shift+符号键按物理键（e.code）归一为基键字符——Shift+[ 的 e.key 是 {，
 // 绑定表统一记基键形式 shift+[（美式物理键位）
 const SHIFT_BASE_KEYS = {
@@ -17,6 +17,7 @@ window.comboOf = function (e) {
   if (e.ctrlKey) parts.push('ctrl');
   if (e.altKey) parts.push('alt');
   if (e.shiftKey) parts.push('shift');
+  if (e.metaKey) parts.push('meta');
   let key = e.key;
   if (key === ' ') key = 'Space';
   else if (e.shiftKey && SHIFT_BASE_KEYS[e.code]) key = SHIFT_BASE_KEYS[e.code];
@@ -53,7 +54,7 @@ const ACTION_LABELS = {
   sub_delay_minus_coarse: '字幕延迟 −0.5s',
   sub_delay_plus_coarse: '字幕延迟 +0.5s',
   sub_delay_reset: '字幕延迟归零',
-  toggle_panel: '自动收放面板',
+  toggle_panel: '展开 / 收起字幕抽屉（Windows）',
   recall_mpv: '召回 mpv 窗口',
   fit_video_window: '窗口重置为视频大小',
   anki_export: '导出当前句到 Anki',
@@ -103,7 +104,7 @@ const SettingsUI = {
       </section>
       <section>
         <h3>音频</h3>
-        <label class="row"><input type="checkbox" data-k="audio.dialogue_boost" ${s.audio.dialogue_boost ? 'checked' : ''} /> 对白增强（稳定短时压缩）</label>
+        <label class="row"><input type="checkbox" data-k="audio.dialogue_boost" ${s.audio.dialogue_boost ? 'checked' : ''} /> 对白增强（语音频段优化）</label>
         <label>音量上限 %（0 = 不限制）<input type="number" data-k="audio.volume_max" value="${s.audio.volume_max ?? 0}" /></label>
       </section>
       <section>
@@ -133,11 +134,10 @@ const SettingsUI = {
       </section>
       <section>
         <h3>外部程序</h3>
-        <label>mpv / ffmpeg 所在目录（留空按 PATH → 应用目录查找）<input data-k="bins.dir" value="${esc(s.bins.dir)}" /></label>
+        <label>mpv / ffmpeg 所在目录（安装版留空使用内置组件；源码运行会自动搜索 PATH 与 Homebrew）<input data-k="bins.dir" value="${esc(s.bins.dir)}" /></label>
       </section>
       <section>
         <h3>窗口</h3>
-        <label class="row"><input type="checkbox" data-k="window.mini_bar" ${s.window.mini_bar ? 'checked' : ''} /> 播放时自动收起为迷你条</label>
         <label class="row"><input type="checkbox" data-k="window.sink_on_blur" ${s.window.sink_on_blur ? 'checked' : ''} /> 切走时取消置顶（沉底）</label>
         <label class="row"><input type="checkbox" data-k="window.recall_mpv_on_focus" ${s.window.recall_mpv_on_focus ? 'checked' : ''} /> 切回时召回 mpv 窗口</label>
       </section>

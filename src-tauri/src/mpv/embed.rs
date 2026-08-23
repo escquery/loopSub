@@ -8,6 +8,7 @@
 //! mpv_wait_event 只能单线程调用——专用事件线程消费事件队列，并在收到
 //! SHUTDOWN（用户直接关闭 mpv 窗口）时置 dead 标志供上层感知。
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_ulong, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use serde_json::Value;
+use tauri::Emitter;
 
 // ---- mpv client.h 常量（ABI 稳定，见 mpv 文档"Client API changes"） ----
 const MPV_FORMAT_STRING: c_int = 1;
@@ -22,6 +24,7 @@ const MPV_FORMAT_FLAG: c_int = 3;
 const MPV_FORMAT_INT64: c_int = 4;
 const MPV_FORMAT_DOUBLE: c_int = 5;
 const MPV_EVENT_SHUTDOWN: c_int = 1;
+const MPV_EVENT_CLIENT_MESSAGE: c_int = 16;
 
 /// 只需读首字段；后续字段按 client.h 原样排布以保证偏移正确
 #[repr(C)]
@@ -32,6 +35,14 @@ struct MpvEvent {
     data: *mut c_void,
 }
 
+/// MPV_EVENT_CLIENT_MESSAGE 的 data（client.h: mpv_event_client_message）。
+/// mpv 视频窗获得焦点时，绑定键通过 script-message 回送到 Tauri 前端。
+#[repr(C)]
+struct MpvEventClientMessage {
+    num_args: c_int,
+    args: *mut *const c_char,
+}
+
 type Handle = *mut c_void;
 
 /// dlopen 得到的 C API 函数表；Library 随表持有，保证函数指针始终有效
@@ -40,9 +51,11 @@ pub struct MpvApi {
     client_api_version: unsafe extern "C" fn() -> c_ulong,
     create: unsafe extern "C" fn() -> Handle,
     initialize: unsafe extern "C" fn(Handle) -> c_int,
+    #[cfg_attr(not(windows), allow(dead_code))]
     set_option: unsafe extern "C" fn(Handle, *const c_char, c_int, *mut c_void) -> c_int,
     set_option_string: unsafe extern "C" fn(Handle, *const c_char, *const c_char) -> c_int,
     command: unsafe extern "C" fn(Handle, *mut *const c_char) -> c_int,
+    #[cfg_attr(not(windows), allow(dead_code))]
     command_string: unsafe extern "C" fn(Handle, *const c_char) -> c_int,
     get_property: unsafe extern "C" fn(Handle, *const c_char, c_int, *mut c_void) -> c_int,
     get_property_string: unsafe extern "C" fn(Handle, *const c_char) -> *mut c_char,
@@ -156,7 +169,7 @@ fn format_of(name: &str) -> c_int {
         "chapter" | "chapter-count" | "playlist-pos" | "playlist-count" | "edition"
         // dwidth/dheight：视频显示像素；STRING 分支会返回 "1920" 字符串，
         // 前端 typeof number 守卫静默丢弃（窗口重置为视频大小失效）
-        | "dwidth" | "dheight" => {
+        | "dwidth" | "dheight" | "window-id" => {
             MPV_FORMAT_INT64
         }
         _ => MPV_FORMAT_STRING,
@@ -214,7 +227,13 @@ impl MpvEmbed {
         ] {
             let ck = CString::new(k).unwrap();
             let cv = CString::new(v).unwrap();
-            api.check(unsafe { (api.set_option_string)(handle, ck.as_ptr(), cv.as_ptr()) })
+            let code = unsafe { (api.set_option_string)(handle, ck.as_ptr(), cv.as_ptr()) };
+            // 裁剪掉 Lua/JavaScript/OSC 的轻量 libmpv 构建没有 osc 选项；这类
+            // 构建本来就不会显示 OSC，因此 option-not-found（-5）等同目标状态。
+            if k == "osc" && code == -5 {
+                continue;
+            }
+            api.check(code)
                 .map_err(|e| format!("设置 {k}={v} 失败: {e}"))?;
         }
         Ok(())
@@ -228,11 +247,13 @@ impl MpvEmbed {
         handle: Handle,
         dead: &Arc<AtomicBool>,
         closing: &Arc<AtomicBool>,
+        app: &tauri::AppHandle,
     ) -> JoinHandle<()> {
         std::thread::spawn({
             let api = api.clone();
             let dead = dead.clone();
             let closing = closing.clone();
+            let app = app.clone();
             let handle = handle as usize;
             move || {
                 let handle = handle as Handle;
@@ -244,9 +265,35 @@ impl MpvEmbed {
                     if closing.load(Ordering::SeqCst) {
                         break;
                     }
-                    if !ev.is_null() && unsafe { (*ev).event_id } == MPV_EVENT_SHUTDOWN {
-                        dead.store(true, Ordering::SeqCst);
-                        break;
+                    if ev.is_null() {
+                        continue;
+                    }
+                    match unsafe { (*ev).event_id } {
+                        MPV_EVENT_SHUTDOWN => {
+                            dead.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        MPV_EVENT_CLIENT_MESSAGE => unsafe {
+                            let data = (*ev).data as *const MpvEventClientMessage;
+                            if data.is_null() || (*data).args.is_null() || (*data).num_args < 2 {
+                                continue;
+                            }
+                            let args = std::slice::from_raw_parts(
+                                (*data).args,
+                                (*data).num_args as usize,
+                            );
+                            let arg = |i: usize| {
+                                args.get(i)
+                                    .filter(|p| !p.is_null())
+                                    .map(|p| CStr::from_ptr(*p).to_string_lossy().into_owned())
+                            };
+                            if arg(0).as_deref() == Some("loopsub-hotkey") {
+                                if let Some(action) = arg(1) {
+                                    let _ = app.emit("mpv-hotkey", action);
+                                }
+                            }
+                        },
+                        _ => {}
                     }
                 }
             }
@@ -327,7 +374,7 @@ impl MpvEmbed {
 
         let dead = Arc::new(AtomicBool::new(false));
         let closing = Arc::new(AtomicBool::new(false));
-        let event_thread = Self::spawn_event_thread(&api, handle, &dead, &closing);
+        let event_thread = Self::spawn_event_thread(&api, handle, &dead, &closing, app);
         Ok(Self {
             api,
             handle: handle as usize,
@@ -346,6 +393,21 @@ impl MpvEmbed {
     /// mpv core 是否已退出（事件线程侦测）
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
+    }
+
+    /// 把前端快捷键同步成 mpv 输入段。macOS 的视频是独立原生窗口；焦点在
+    /// 该窗口时 WebView 收不到 keydown，因此由 mpv 捕获后通过 client-message
+    /// 转发为 `mpv-hotkey` Tauri 事件。Windows 内嵌窗不收输入，但绑定无害。
+    pub fn bind_hotkeys(&self, hotkeys: &HashMap<String, String>) -> Result<(), String> {
+        let config = hotkey_section(hotkeys);
+        self.command(vec![
+            "define-section".into(),
+            "loopsub".into(),
+            config.into(),
+            "force".into(),
+        ])?;
+        self.command(vec!["enable-section".into(), "loopsub".into()])?;
+        Ok(())
     }
 
     /// 与 [`crate::mpv::MpvIpc::command`] 同形的命令入口：
@@ -480,12 +542,44 @@ pub fn resolve_dll(settings_dir: Option<PathBuf>) -> Option<PathBuf> {
     #[cfg(all(unix, not(target_os = "macos")))]
     const NAMES: [&str; 2] = ["libmpv.so.2", "libmpv.so"];
 
-    let mut dirs: Vec<PathBuf> = settings_dir.into_iter().collect();
+    let mut dirs = Vec::<PathBuf>::new();
+    if let Some(dir) = settings_dir {
+        dirs.push(dir.clone());
+        dirs.push(dir.join("lib"));
+        // 设置页常填 Homebrew 的 bin 目录；libmpv 实际在同级 lib。
+        if dir.file_name().and_then(|n| n.to_str()) == Some("bin") {
+            if let Some(prefix) = dir.parent() {
+                dirs.push(prefix.join("lib"));
+            }
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             dirs.push(dir.to_path_buf());
             dirs.push(dir.join("mpv"));
             dirs.push(dir.join("resources"));
+            // macOS bundle：可执行文件在 Contents/MacOS，资源在 Contents/Resources。
+            #[cfg(target_os = "macos")]
+            if let Some(contents) = dir.parent() {
+                let resources = contents.join("Resources");
+                dirs.push(resources.clone());
+                dirs.push(resources.join("mpv"));
+                dirs.push(resources.join("lib"));
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Finder 启动的 .app 没有 Homebrew PATH；dlopen 裸名在 Apple Silicon 上
+        // 也不会自动搜索 /opt/homebrew/lib，因此显式覆盖两种 Homebrew 前缀。
+        if let Some(prefix) = std::env::var_os("HOMEBREW_PREFIX") {
+            let prefix = PathBuf::from(prefix);
+            dirs.push(prefix.join("lib"));
+            dirs.push(prefix.join("opt/mpv/lib"));
+        }
+        for prefix in [Path::new("/opt/homebrew"), Path::new("/usr/local")] {
+            dirs.push(prefix.join("lib"));
+            dirs.push(prefix.join("opt/mpv/lib"));
         }
     }
     dirs.iter()
@@ -493,8 +587,79 @@ pub fn resolve_dll(settings_dir: Option<PathBuf>) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// 系统安装的 libmpv 裸名（Linux 发行版仓库、macOS Homebrew）：
-/// 走系统动态库搜索路径，作为 resolve_dll 找不到文件时的兜底
+/// 浏览器组合键名 → mpv input.conf 键名。
+/// Shift+符号按 settings.js 的美式物理键归一规则还原为实际字符，避免 mpv
+/// 忽略文本键的 Shift 修饰后与未按 Shift 的绑定冲突。
+fn combo_to_mpv(combo: &str) -> Option<String> {
+    let mut parts: Vec<&str> = combo.split('+').collect();
+    let key = parts.pop()?;
+    if key.is_empty() || key.contains(['\n', '\r', ' ', '"']) {
+        return None;
+    }
+    let mut shift = false;
+    let mut modifiers = Vec::new();
+    for modifier in parts {
+        match modifier.to_ascii_lowercase().as_str() {
+            "ctrl" => modifiers.push("Ctrl"),
+            "alt" => modifiers.push("Alt"),
+            "meta" => modifiers.push("Meta"),
+            "shift" => shift = true,
+            _ => return None,
+        }
+    }
+    let mut key = match key {
+        "Space" => "SPACE".to_string(),
+        "Enter" => "ENTER".to_string(),
+        "Escape" => "ESC".to_string(),
+        "ArrowLeft" => "LEFT".to_string(),
+        "ArrowRight" => "RIGHT".to_string(),
+        "ArrowUp" => "UP".to_string(),
+        "ArrowDown" => "DOWN".to_string(),
+        "Backspace" => "BS".to_string(),
+        "Delete" => "DEL".to_string(),
+        "#" => "SHARP".to_string(),
+        other => other.to_string(),
+    };
+    let is_special = matches!(
+        key.as_str(),
+        "SPACE" | "ENTER" | "ESC" | "LEFT" | "RIGHT" | "UP" | "DOWN" | "BS" | "DEL"
+    );
+    if shift && !is_special {
+        let shifted = match key.as_str() {
+            "[" => Some("{"), "]" => Some("}"), "," => Some("<"), "." => Some(">"),
+            "/" => Some("?"), "\\" => Some("|"), ";" => Some(":"), "'" => Some("\""),
+            "-" => Some("_"), "=" => Some("+"), "`" => Some("~"), "1" => Some("!"),
+            "2" => Some("@"), "3" => Some("#"), "4" => Some("$"), "5" => Some("%"),
+            "6" => Some("^"), "7" => Some("&"), "8" => Some("*"), "9" => Some("("),
+            "0" => Some(")"), _ => None,
+        };
+        if let Some(produced) = shifted {
+            key = if produced == "#" { "SHARP".into() } else { produced.into() };
+        } else if key.chars().count() == 1 && key.chars().all(|c| c.is_ascii_alphabetic()) {
+            key.make_ascii_uppercase();
+        } else {
+            modifiers.push("Shift");
+        }
+    } else if shift {
+        modifiers.push("Shift");
+    }
+    modifiers.push(&key);
+    Some(modifiers.join("+"))
+}
+
+pub fn hotkey_section(hotkeys: &HashMap<String, String>) -> String {
+    let mut rows: Vec<_> = hotkeys.iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    rows.into_iter()
+        .filter(|(action, _)| action.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .filter_map(|(action, combo)| {
+            combo_to_mpv(combo).map(|key| format!("{key} script-message loopsub-hotkey {action}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 系统动态库裸名兜底。
 pub fn system_dll_name() -> &'static str {
     #[cfg(windows)]
     return "libmpv-2.dll";
@@ -502,4 +667,43 @@ pub fn system_dll_name() -> &'static str {
     return "libmpv.dylib";
     #[cfg(all(unix, not(target_os = "macos")))]
     return "libmpv.so.2";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_browser_combos_to_mpv_keys() {
+        assert_eq!(combo_to_mpv("Space").as_deref(), Some("SPACE"));
+        assert_eq!(combo_to_mpv("alt+shift+ArrowLeft").as_deref(), Some("Alt+Shift+LEFT"));
+        assert_eq!(combo_to_mpv("ctrl+[").as_deref(), Some("Ctrl+["));
+        // mpv 会忽略文本键显式 Shift；必须绑定实际产生的花括号。
+        assert_eq!(combo_to_mpv("shift+[").as_deref(), Some("{"));
+        assert_eq!(combo_to_mpv("meta+k").as_deref(), Some("Meta+k"));
+    }
+
+    #[test]
+    fn configured_prefix_lib_is_found() {
+        let root = std::env::temp_dir().join(format!(
+            "loopsub-libmpv-prefix-{}",
+            std::process::id()
+        ));
+        let lib = root.join("lib").join(system_dll_name());
+        std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        std::fs::write(&lib, b"fake").unwrap();
+        assert_eq!(resolve_dll(Some(root.clone())), Some(lib));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn hotkey_section_is_stable_and_rejects_injected_actions() {
+        let mut hotkeys = HashMap::new();
+        hotkeys.insert("toggle_pause".into(), "Space".into());
+        hotkeys.insert("bad\naction".into(), "x".into());
+        assert_eq!(
+            hotkey_section(&hotkeys),
+            "SPACE script-message loopsub-hotkey toggle_pause"
+        );
+    }
 }

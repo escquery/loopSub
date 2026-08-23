@@ -58,8 +58,8 @@ mpv --idle=yes --force-window \
 
 | 状态 | 界面 |
 |---|---|
-| 播放中 | 零打扰：迷你条显示当前句两行字幕（原文+译文） |
-| 暂停 | 迷你条展开：当前句 + 操作按钮 |
+| 播放中 | macOS 完整面板常驻，当前句自动高亮；Windows 使用右侧字幕抽屉 |
+| 暂停 | 面板尺寸不变，继续显示句子列表与操作按钮 |
 | 浏览 | 主面板：全量句子列表 / 搜索 / 翻译管理 / 设置 |
 
 ## 3. mpv 控制（JSON IPC）
@@ -186,7 +186,7 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 | `Alt+←` `Alt+→` | 字幕延迟 ∓0.1s（双轨联动） |
 | `Alt+Shift+←` `Alt+Shift+→` | 字幕延迟 ∓0.5s |
 | `Alt+0` | 延迟归零 |
-| `S` 或 `Tab` | 展开/收起面板 |
+| `S` | 展开/收起字幕抽屉（仅 Windows） |
 | `W` | 召回视频窗口 |
 
 所有快捷键操作通过 mpv `show-text` 在视频画面弹瞬态反馈（如 `A: 00:12.3`、`1.3x`）。
@@ -194,7 +194,7 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 ## 9. 状态面板
 
 - 常亮徽章条：`AB循环 12.3→15.8s`、`跟读`、`译文`、`1.3x`、`字幕+0.2s`，**点击徽章即关闭对应功能**
-- 迷你条模式下保留徽章条
+- macOS 面板始终完整展开，徽章条常驻
 
 ## 10. 音频
 
@@ -215,7 +215,7 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 | OpenSubtitles | API Key | 空（用时校验） |
 | LLM | Base URL / 模型 / API Key / 并发 / 批次大小 / 超时 | 空（用时校验） |
 | 缓存 | 缓存目录、清理策略 | 系统应用数据目录 |
-| 窗口 | 停靠侧、迷你条、失焦沉底、切回召回 mpv | 右 / 开 / 开 / 开 |
+| 窗口 | 停靠侧、失焦沉底、切回召回 mpv | 右 / 开 / 开 |
 
 ## 12. 缓存目录结构
 
@@ -233,9 +233,9 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 
 | | Windows | macOS | WSL（开发） |
 |---|---|---|---|
-| IPC 传输 | 命名管道 `\\.\pipe\loopsub-mpv` | Unix socket | Unix socket |
-| mpv/ffmpeg 分发 | sidecar 绿色 exe | sidecar（需随包签名公证） | 系统安装 |
-| 出包 | GitHub Actions `windows-latest` | GitHub Actions `macos-latest` | 不出包 |
+| 播放控制 | 进程内 libmpv（Win32 子窗口） | 进程内 libmpv（Cocoa 视频窗 + Tauri 面板） | 手动 IPC / 系统 mpv |
+| mpv/ffmpeg 分发 | 内置 DLL + 绿色 exe | 内置同架构 dylib + 静态可执行文件 | 系统安装 |
+| 出包 | GitHub Actions `windows-latest` | `macos-latest` ARM + `macos-15-intel` | 不出包 |
 | WebView | WebView2 (Chromium) | WKWebView | WebKitGTK（≈mac 预览） |
 
 - 子进程隐藏控制台：Windows `CREATE_NO_WINDOW`
@@ -243,6 +243,6 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 
 ## 14. 里程碑
 
-- **v1（闭环）✅ 已完成**：面板遥控 mpv（播放/seek/速度/AB/单句循环/跟读）+ 内嵌字幕导出 + 句子列表（点击跳转/多选复制英文）+ 迷你条当前句 + 快捷键 + 设置页（含音频、热键改绑）+ 窗口行为（失焦沉底/切回召回 mpv/自动收放）
+- **v1（闭环）✅ 已完成**：面板遥控 mpv（播放/seek/速度/AB/单句循环/跟读）+ 内嵌字幕导出 + 句子列表（点击跳转/多选复制英文）+ 快捷键 + 设置页（含音频、热键改绑）+ 窗口行为（失焦沉底/切回召回 mpv）
 - **v1.5 ✅ 已完成**：OpenSubtitles 搜索（moviehash 精确 + 文件名解析回退）+ LLM 翻译管线（两级分块/摘要链/术语表防伪/错误明细重试）+ 缓存 + 译文显隐
-- **v2（进行中）**：翻译并发与断点续翻 ✅（限并发编排 + 摘要池宽松共享 + 批粒度 progress 落盘 + 行内容级缓存 lines/<model>.jsonl）；悬浮字幕条 ✅（透明/无边框/置顶/不抢焦点的独立 webview 窗，hover 展开控件 700ms 延迟收起，拖拽位置记忆；经事件总线与主面板互通——字幕条只做展示与发 action，播放状态由主面板单点执行）；ffsubsync 同步修复 ✅（自研零依赖：ffmpeg 提 8kHz PCM → 40ms 帧能量包络 → 5 段重叠窗归一化互相关（corr/峰显著性双重条件过滤假峰）→ 加权最小二乘回归：截距→sub-delay、斜率→sub-speed，恒定偏移与 23.976/25fps 线性漂移都修；不改字幕文件，结果存 videos/<hash>.json 下次自动应用）；Anki 导出 ✅（K 键导出当前句：mpv screenshot 干净帧 + ffmpeg 音频切片 ±0.25s 边沿 + 双语/出处 → AnkiConnect 推送，首导自动建五字段笔记模型；连不上 Anki 兑底导出 anki_exports/<hash>/ 媒体+notes.tsv 手动导入；去重/模型与请求构造 12 项单测）；待办：macOS 窗口召回——方案已定待 Mac 真机实现：不用 AX API（需辅助功能授权），用 NSRunningApplication 双 activate（先 mpv 再面板，零权限，等价 HWND_TOP+SWP_NOACTIVATE）；依赖 objc2-app-kit 0.3（Tauri 依赖树已有，零新增）；mpv 内嵌（libmpv）移出 v2——需 Windows 真机最小 demo 验证渲染链路后单独评估
+- **v2 ✅ 已完成**：进程内 libmpv；Windows 单窗口内嵌；macOS Cocoa 视频窗与完整常驻控制面板并排、AppKit 零权限召回、视频窗快捷键回传；翻译并发与断点续翻；字幕自动对齐；Anki 导出；Windows/macOS 安装包内置同架构 libmpv、ffmpeg 与 ffprobe。

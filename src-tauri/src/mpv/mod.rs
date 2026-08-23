@@ -176,6 +176,30 @@ impl Mpv {
     pub fn is_dead(&self) -> bool {
         matches!(self, Self::Embed(e) if e.is_dead())
     }
+
+    /// 同步窗口内快捷键。独立 mpv 视频窗口获得焦点时，由 mpv 捕获按键并以
+    /// client-message 转回前端；手动 IPC 模式也使用同一 input section。
+    pub async fn bind_hotkeys(
+        &self,
+        hotkeys: &std::collections::HashMap<String, String>,
+    ) -> Result<(), MpvError> {
+        match self {
+            Self::Embed(e) => e.bind_hotkeys(hotkeys).map_err(MpvError::Mpv),
+            Self::Ipc(i) => {
+                let config = embed::hotkey_section(hotkeys);
+                i.command(vec![
+                    "define-section".into(),
+                    "loopsub".into(),
+                    config.into(),
+                    "force".into(),
+                ])
+                .await?;
+                i.command(vec!["enable-section".into(), "loopsub".into()])
+                    .await?;
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

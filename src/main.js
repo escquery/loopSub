@@ -25,6 +25,8 @@ const state = {
   hotkeyMap: {},       // combo -> action（由 settings.hotkeys 反转）
   copyTemplate: '请逐句讲解以下美剧台词中的生词、短语和口语用法：\n\n{lines}',
   delayStep: 0.1,
+  subDelay: 0,
+  subSpeed: 1,
 };
 
 // 禁用 WebView2 默认右键菜单（播放器 UI 不应露浏览器菜单）；输入框保留编辑菜单
@@ -120,7 +122,12 @@ async function loadVideo(path) {
     state.currentIdx = -1;
     state.selected.clear();
     markConnected();
-    applySavedSyncOffset();
+    // libmpv 属性跨 loadfile 保留；先清掉上一视频的对齐值，再恢复当前视频记录。
+    state.subDelay = 0;
+    state.subSpeed = 1;
+    await mpv('set_property', 'sub-delay', 0);
+    await mpv('set_property', 'sub-speed', 1);
+    await applySavedSyncOffset();
     renderList();
     if (singleMode) invoke('webview_ready').catch(() => {}); // 视频加载完成后抬顶+落位视频层
     $('#trans-bar').classList.toggle('hidden', state.lines.length === 0);
@@ -153,6 +160,13 @@ $('#btn-browse').addEventListener('click', async () => {
   } catch (e) {
     showNotice('打开文件对话框失败: ' + esc(String(e)));
   }
+});
+
+// macOS Finder“打开方式”/拖到 Dock 图标；冷启动另由 take_startup_video
+// 兜底。重复的同一路径不重载，加载中的事件也由 loadVideo 自身去重。
+listen('open-video', (e) => {
+  const path = String(e.payload ?? '');
+  if (path && path !== state.videoPath) loadVideo(path);
 });
 
 // 后端分阶段推送加载进度（探测/提取字幕/启动播放器），首次打开不再“卡死”
@@ -437,11 +451,21 @@ listEl.addEventListener('mousedown', (e) => {
   syncSelectionUI();
 });
 
+function subtitleToMediaSeconds(ms) {
+  const speed = state.subSpeed > 0 ? state.subSpeed : 1;
+  return ms / 1000 * speed + state.subDelay;
+}
+
+function mediaToSubtitleMs(seconds) {
+  const speed = state.subSpeed > 0 ? state.subSpeed : 1;
+  return (seconds - state.subDelay) / speed * 1000;
+}
+
 function seekToLine(idx) {
   const l = state.lines[idx];
   if (!l) return;
   state.followPausedIdx = -1;
-  mpv('seek', l.start_ms / 1000, 'absolute');
+  mpv('seek', Math.max(0, subtitleToMediaSeconds(l.start_ms)), 'absolute');
   mpv('set_property', 'pause', false);
 }
 
@@ -492,6 +516,10 @@ setInterval(async () => {
   if (!state.connected) return;
   const paused = await mpv('get_property', 'pause');
   const pos = await mpv('get_property', 'time-pos');
+  const delay = await mpv('get_property', 'sub-delay');
+  const subSpeed = await mpv('get_property', 'sub-speed');
+  if (typeof delay === 'number') state.subDelay = delay;
+  if (typeof subSpeed === 'number' && subSpeed > 0) state.subSpeed = subSpeed;
   // 进度条跟新（拖动中由拖动逻辑接管，避免覆盖打架）
   if (singleMode && !progressDragging) {
     const pct = await mpv('get_property', 'percent-pos');
@@ -500,10 +528,13 @@ setInterval(async () => {
   if (typeof pos === 'number') {
     if (singleMode) $('#pos-time').textContent = fmtTime(pos * 1000);
     if (state.lines.length > 0) {
-      setCurrent(findCurrent(pos * 1000));
+      // 面板字幕也必须使用 mpv 的 sub-delay/sub-speed 时间映射，否则 macOS
+      // 默认面板模式下“自动对齐”和延迟微调只改了隐藏字幕，界面毫无变化。
+      const subPosMs = mediaToSubtitleMs(pos);
+      setCurrent(findCurrent(subPosMs));
       if (state.followMode && state.currentIdx >= 0) {
         const line = state.lines[state.currentIdx];
-        if (line && pos * 1000 >= line.end_ms && state.followPausedIdx !== state.currentIdx) {
+        if (line && subPosMs >= line.end_ms && state.followPausedIdx !== state.currentIdx) {
           state.followPausedIdx = state.currentIdx;
           mpv('set_property', 'pause', true);
           osd('跟读暂停');
@@ -513,18 +544,13 @@ setInterval(async () => {
   }
   const speed = await mpv('get_property', 'speed');
   if (typeof speed === 'number') $('#speed-label').textContent = speed.toFixed(1) + 'x';
-  // 迷你条：设置开启时跟随播放/暂停自动收放（单窗口模式无迷你条）
-  if (!singleMode && state.settings?.window?.mini_bar && typeof paused === 'boolean') {
-    document.body.classList.toggle('mini', !paused);
-  }
-  updateBadges(paused);
+  updateBadges(paused, state.subDelay);
 }, 300);
 
 // ---------- 状态徽章（点击即关闭对应功能） ----------
-async function updateBadges(paused) {
+async function updateBadges(paused, delay) {
   // 未设置 AB 点时 mpv 侧读 ab-loop-a 报错，catch 兜底为 null（badge 不显示）
   const abA = await mpv('get_property', 'ab-loop-a').catch(() => null);
-  const delay = await mpv('get_property', 'sub-delay');
   const badges = [];
   if (paused) badges.push({ id: 'paused', label: '暂停' });
   if (typeof abA === 'number') badges.push({ id: 'ab', label: 'AB循环' });
@@ -616,8 +642,8 @@ async function toggleSentenceLoop() {
   } else {
     const l = state.lines[state.currentIdx];
     if (!l) return;
-    await mpv('set_property', 'ab-loop-a', l.start_ms / 1000);
-    await mpv('set_property', 'ab-loop-b', l.end_ms / 1000);
+    await mpv('set_property', 'ab-loop-a', subtitleToMediaSeconds(l.start_ms));
+    await mpv('set_property', 'ab-loop-b', subtitleToMediaSeconds(l.end_ms));
     state.sentenceLoop = true;
     osd('单句循环 开');
   }
@@ -634,6 +660,7 @@ async function adjustSubDelay(delta, reset = false) {
   if (typeof cur !== 'number') return;
   const next = reset ? 0 : Math.round((cur + delta) * 100) / 100;
   await mpv('set_property', 'sub-delay', next);
+  state.subDelay = next;
   osd(`字幕延迟 ${next >= 0 ? '+' : ''}${next.toFixed(2)}s`);
 }
 
@@ -668,6 +695,8 @@ async function autoSync() {
     });
     await mpv('set_property', 'sub-delay', r.delay_s);
     await mpv('set_property', 'sub-speed', r.speed);
+    state.subDelay = r.delay_s;
+    state.subSpeed = r.speed;
     await invoke('save_sync_offset', {
       videoHash: state.videoHash,
       offset: { delay_s: r.delay_s, speed: r.speed },
@@ -689,6 +718,8 @@ async function applySavedSyncOffset() {
     if (off && off.speed > 0) {
       await mpv('set_property', 'sub-delay', off.delay_s);
       await mpv('set_property', 'sub-speed', off.speed);
+      state.subDelay = off.delay_s;
+      state.subSpeed = off.speed;
       osd(`已恢复对齐：${fmtSyncOffset(off.delay_s, off.speed)}`);
     }
   } catch {
@@ -740,17 +771,19 @@ const actions = {
   sub_delay_minus_coarse: () => adjustSubDelay(-0.5),
   sub_delay_plus_coarse: () => adjustSubDelay(0.5),
   sub_delay_reset: () => adjustSubDelay(0, true),
-  toggle_panel: () => {
-    if (singleMode) return toggleDrawer();
-    const cur = state.settings?.window?.mini_bar ?? true;
-    if (state.settings) state.settings.window.mini_bar = !cur;
-    document.body.classList.toggle('mini', cur); // 关闭自动收放时立即展开
-    osd(cur ? '自动收放 关' : '自动收放 开');
-  },
+  // macOS 控制面板始终完整常驻；该动作只保留给 Windows 字幕抽屉。
+  toggle_panel: () => { if (singleMode) toggleDrawer(); },
   recall_mpv: () => invoke('recall_mpv').then(() => osd('已召回 mpv')).catch(osd),
   fit_video_window: () => fitVideoWindow(),
   anki_export: () => exportAnki(),
 };
+
+// macOS/Linux 的 mpv 视频窗获得焦点时，libmpv input section 将动作名通过
+// client-message → Tauri 事件送回这里，因此与 WebView keydown 共用同一动作表。
+listen('mpv-hotkey', (e) => {
+  const action = String(e.payload ?? '');
+  if (action && actions[action]) actions[action]();
+});
 
 // ---------- Anki 导出（K：截图+音频切片+双语文本 → AnkiConnect/兜底文件） ----------
 async function exportAnki() {
@@ -862,7 +895,16 @@ async function initWindowMode() {
   try {
     singleMode = (await invoke('window_mode')) === 'single';
   } catch { return; }
-  if (!singleMode) return;
+  // 命令行参数和 macOS Finder Opened 冷启动路径在所有窗口形态都要消费；
+  // 旧逻辑位于 singleMode 分支内，导致 macOS 收到路径后永远不打开。
+  let startup = null;
+  try {
+    startup = await invoke('take_startup_video');
+  } catch {}
+  if (!singleMode) {
+    if (startup) loadVideo(startup);
+    return;
+  }
   // 单窗口模式不需要悬浮面板的自动置顶；启动时也主动清掉可能由早到的
   // focus 事件或旧逻辑留下的 topmost 状态，保证鼠标与 Alt+Tab 行为一致。
   invoke('set_always_on_top', { flag: false }).catch(() => {});
@@ -886,11 +928,8 @@ async function initWindowMode() {
   }
   // 通知 Rust 侧 webview 已就绪：抬升并重排 mpv 子窗口
   invoke('webview_ready').catch(() => {});
-  // 右键菜单“用 loopSub 播放”带入的启动视频（Rust 侧启动参数解析，取出一次即消费）
-  try {
-    const startup = await invoke('take_startup_video');
-    if (startup) loadVideo(startup);
-  } catch {}
+  // 右键菜单“用 loopSub 播放”带入的启动视频
+  if (startup) loadVideo(startup);
 }
 
 // ---------- 启动 / 设置热加载 ----------

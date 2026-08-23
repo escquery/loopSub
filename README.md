@@ -1,14 +1,15 @@
 # loopSub
 
-用字幕驱动美剧学习的播放器：单窗口内嵌 libmpv，逐句跳转 / AB 复读 / 跟读暂停 / 字幕搜索与对齐 / LLM 翻译 / Anki 制卡一体化。
+用字幕驱动美剧学习的播放器：Windows 单窗口内嵌 libmpv，macOS 使用轻量控制面板 + 原生视频窗；逐句跳转 / AB 复读 / 跟读暂停 / 字幕搜索与对齐 / LLM 翻译 / Anki 制卡一体化。
 
 > 目标平台：Windows、macOS ｜ 技术栈：Tauri 2 + Rust + 纯静态前端（无 node 依赖）
 
 ## 核心理念
 
-**libmpv 永远不获得焦点，它是纯显示层；loopSub 单窗口是唯一交互面。**
+**Windows 下 libmpv 是不接收输入的纯显示层；macOS 独立视频窗获得焦点时，快捷键由 libmpv 转发回 loopSub 动作表。**
 
-```
+```text
+Windows：
 ┌─ loopSub 主窗口（唯一窗口、唯一焦点） ─────────────┐
 │  顶栏  📂 🕘 🔍 ⚙ 1:1                              │
 │  ┌────────────────────────────┐ ┌────────────────┐ │
@@ -20,7 +21,7 @@ loopSub ──dlopen──> libmpv         （播放控制全部进程内调用�
 loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 ```
 
-由此不需要全局热键（按键都是窗口内普通事件）。libmpv 以 dlopen 方式进程内加载（无子进程、无 IPC 连接与重试），以 `osc=no input-default-bindings=no` 缴械初始化；视频区为应用自建 Win32 子窗口（wid 内嵌），布局与生命周期随主窗口。
+由此不需要全局热键。libmpv 以 dlopen 方式进程内加载（无子进程、无 IPC 连接与重试），以 `osc=no input-default-bindings=no` 初始化；Windows 视频区为应用自建 Win32 子窗口，macOS 则由 libmpv 创建原生视频窗，并用专用 input section 把快捷键动作转回控制面板。
 
 ## 功能
 
@@ -47,7 +48,7 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 - Anki 一键制卡（`K`：当前句截图 + 音频切片 + 双语文本 → AnkiConnect；Anki 未启动时兜底导出文件）
 - 最近播放历史（MRU 20 条，失效自动剔除）+ 播放位置记忆（≥5s 自动续播）
 - 常亮状态徽章（AB / 跟读 / 译文 / 速度 / 延迟），点击即关闭
-- 迷你条模式：播放中只显示当前句两行字幕
+- macOS 字幕控制面板始终完整展开并常驻，不随播放/暂停自动缩放
 
 **窗口与系统集成**
 - 失焦自动沉底、切回自动召回与置顶（均可在设置页关闭）
@@ -63,11 +64,11 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 |---|---|---|
 | Windows | `.msi` / `-setup.exe`（NSIS，免管理员） | **已内置 libmpv + ffmpeg，开箱即用** |
 | Windows 便携版 | `loopsub-portable.zip`（解压即用，`tools\pack_portable.ps1` 本地产出） | 同上，全部随包内置 |
-| macOS Apple Silicon | `aarch64.dmg` | 已内置 ffmpeg；libmpv 需 `brew install mpv` |
-| macOS Intel | `x64.dmg` | 同上 |
+| macOS Apple Silicon | `aarch64.dmg` | **已内置原生 libmpv + ffmpeg，开箱即用** |
+| macOS Intel | `x64.dmg` | **已内置原生 libmpv + ffmpeg，开箱即用** |
 
-- macOS 未签名公证：首次运行右键 → 打开；内置的 ffmpeg 为 x86_64 构建，Apple Silicon 首次调用需 Rosetta 2（系统会自动引导安装一次）。
-- 外部程序解析顺序：设置页「外部程序」指定目录 → PATH → 安装目录（内置）。自带版本与系统版本冲突时可在设置页指定期望目录。
+- macOS 未签名公证：首次运行若被拦截，请到「系统设置 → 隐私与安全性」选择“仍要打开”。内置 ffmpeg/ffprobe 与安装包同架构，Apple Silicon 不需要 Rosetta 2。
+- 外部程序解析顺序：设置页指定目录 → PATH → 应用资源 → Homebrew。安装包优先使用内置依赖；源码运行时仍会搜索 `/opt/homebrew/lib`、`/usr/local/lib` 及 `opt/mpv/lib`。
 
 ## 首次使用
 
@@ -95,7 +96,7 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 | `←` `→` | ±2s | `R` | 跟读模式开关 |
 | `↑` `↓` | 上一句/下一句 | `T` | 译文显隐 |
 | `x` / `c` | 减速/加速 0.1 | `V` | 选中/取消当前句 |
-| `z` | 速度还原 | `S` | 展开/收起面板（迷你条） |
+| `z` | 速度还原 | `S` | 展开/收起字幕抽屉（仅 Windows） |
 | `[` / `]` | 设 A 点/B 点 | `W` | 召回窗口 |
 | `Ctrl+[` `Ctrl+]` | A/B 点 −100ms | `Alt+←` `Alt+→` | 字幕延迟 ∓0.1s |
 | `Alt+[` `Alt+]` | A/B 点 +100ms | `Alt+Shift+←` `Alt+Shift+→` | 字幕延迟 ∓0.5s |
@@ -111,22 +112,25 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 
 - **Windows**：从 [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake/releases) 下载 `mpv-dev` 包，将其中的 `libmpv-2.dll` 与 ffmpeg/ffprobe（gyan.dev 静态构建）放到 `src-tauri/target/debug/`（或运行后在设置页指定目录）
 - **Debian/Ubuntu**：`sudo apt install libmpv2 ffmpeg`
-- **macOS**：`brew install mpv ffmpeg`
+- **macOS**：无需 Homebrew。脚本按当前架构下载预编译的 libmpv、ffmpeg、ffprobe（兼容 macOS 11+）到 `target/debug`
 
 ```bash
+./scripts/setup_macos_deps.sh                    # macOS：只下载二进制，不本地编译依赖
 cargo run --manifest-path src-tauri/Cargo.toml   # 开发运行（无 node 步骤）
 cd src-tauri && cargo test --lib                 # 单元测试
 ```
 
+macOS 本地 Release 可执行文件先运行 `./scripts/setup_macos_deps.sh release`；打包可分发的 `.app/.dmg` 则先运行 `./scripts/setup_macos_deps.sh bundle`。
+
 ## 打包
 
-CI 自动出包（`.github/workflows/release.yml`，三平台矩阵：Windows / macOS Intel / macOS ARM）：
+CI 自动出包（`.github/workflows/release.yml`，三平台矩阵：Windows / macOS Intel `macos-15-intel` / macOS ARM）：
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0   # 或在 Actions 页手动触发
 ```
 
-CI 构建前自动下载 libmpv（shinchiro mpv-dev 包）与 ffmpeg（gyan.dev / evermeet 静态构建）注入安装包，产物汇总为草稿 Release。本地打包需 `cargo install tauri-cli` 后 `cargo tauri build`。
+CI 构建前按目标架构下载 libmpv（Windows：shinchiro mpv-dev；macOS：media-kit LGPL video-default）与 ffmpeg（Windows：gyan.dev；macOS：Martin Riedl 静态构建）注入安装包，产物汇总为草稿 Release。本地打包需 `cargo install tauri-cli` 后 `cargo tauri build`。
 
 ## 项目结构
 

@@ -103,8 +103,6 @@ pub struct BinSettings {
 #[serde(default)]
 pub struct WindowSettings {
     pub dock_side: DockSide,
-    /// 播放时收起为迷你条
-    pub mini_bar: bool,
     /// 焦点去无关应用时取消 always-on-top 让面板沉底
     pub sink_on_blur: bool,
     /// 切回面板时主动召回 mpv 窗口到面板下方
@@ -191,7 +189,6 @@ impl Default for WindowSettings {
     fn default() -> Self {
         Self {
             dock_side: DockSide::Right,
-            mini_bar: true,
             sink_on_blur: true,
             recall_mpv_on_focus: true,
             float_bar: false,

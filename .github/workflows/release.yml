@@ -24,7 +24,7 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-13 # Intel Mac
+          - os: macos-15-intel # Intel runner（macos-13 已下线）
             target: x86_64-apple-darwin
           - os: macos-latest # Apple Silicon
             target: aarch64-apple-darwin
@@ -68,17 +68,41 @@ jobs:
           if (-not $dll) { throw "mpv-dev 包内未找到 libmpv-2.dll" }
           Copy-Item $dll.FullName src-tauri\resources\
 
-      # macOS：ffmpeg/ffprobe（evermeet 静态构建，x86_64；ARM Mac 经 Rosetta 2 运行）。
-      # libmpv 无可靠 macOS 静态构建源，需用户 brew install mpv（dylib 走系统搜索路径加载）。
-      - name: Bundle ffmpeg (macOS)
+      # macOS：按目标架构携带 libmpv 与静态 ffmpeg/ffprobe；ARM 不依赖 Rosetta 2。
+      - name: Bundle libmpv & ffmpeg (macOS native)
         if: startsWith(matrix.os, 'macos')
         run: |
+          set -euo pipefail
           mkdir -p src-tauri/resources
-          curl -fL -o ffmpeg.zip "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip"
-          unzip -o ffmpeg.zip -d src-tauri/resources/
-          curl -fL -o ffprobe.zip "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip"
-          unzip -o ffprobe.zip -d src-tauri/resources/
+          if [[ "${{ matrix.target }}" == aarch64-* ]]; then arch=arm64; else arch=amd64; fi
+          for tool in ffmpeg ffprobe; do
+            curl --fail --location --retry 5 --retry-all-errors --connect-timeout 20 \
+              -o "$tool.zip" \
+              "https://ffmpeg.martin-riedl.de/redirect/latest/macos/$arch/release/$tool.zip"
+            unzip -jo "$tool.zip" "$tool" -d src-tauri/resources/
+          done
           chmod +x src-tauri/resources/ffmpeg src-tauri/resources/ffprobe
+
+          # media-kit 的 LGPL 配置 libmpv（含完整依赖 dylib）；给每个库补同目录
+          # rpath，避免原构建机的 Nix rpath 在用户机器上失效。
+          libmpv_release=v0.7.2
+          libmpv_package=libmpv-libs_v0.7.2_macos-$arch-video-default
+          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 20 \
+            -o libmpv.tar.gz \
+            "https://github.com/media-kit/libmpv-darwin-build/releases/download/$libmpv_release/$libmpv_package.tar.gz"
+          tar -xzf libmpv.tar.gz --strip-components=1 -C src-tauri/resources/
+          for dylib in src-tauri/resources/*.dylib; do
+            if ! otool -l "$dylib" | grep 'path @loader_path ' >/dev/null; then
+              install_name_tool -add_rpath @loader_path "$dylib"
+            fi
+            codesign --force --sign - "$dylib"
+          done
+          codesign --force --sign - src-tauri/resources/ffmpeg
+          codesign --force --sign - src-tauri/resources/ffprobe
+
+          file src-tauri/resources/libmpv.dylib src-tauri/resources/ffmpeg src-tauri/resources/ffprobe
+          src-tauri/resources/ffmpeg -version
+          src-tauri/resources/ffprobe -version
 
       # 纯静态前端（src/*.html|js|css + withGlobalTauri），无 node 构建步骤；
       # tauri-action 检测到无 package.json 时自动使用 cargo tauri build。
@@ -92,7 +116,7 @@ jobs:
           releaseBody: |
             ## 安装
             - **Windows**：`.msi` 或 `-setup.exe`（NSIS，当前用户安装，无需管理员），已内置 libmpv 与 ffmpeg，开箱即用
-            - **macOS**：`.dmg`（Apple Silicon 用 aarch64，Intel 用 x64），已内置 ffmpeg；**libmpv 需自行安装**：`brew install mpv`
+            - **macOS**：`.dmg`（Apple Silicon 用 aarch64，Intel 用 x64），已内置同架构 libmpv、ffmpeg 与 ffprobe，开箱即用
 
             ## 外部依赖
             未随包携带的程序可在 loopSub 设置页「外部程序」中指定所在目录，或加入 PATH。
@@ -100,6 +124,5 @@ jobs:
           prerelease: false
           args: --target ${{ matrix.target }}
 
-# TODO（后续迭代）：macOS 的 libmpv 随包携带
-#   无可靠静态构建源（stolendata 已不可用）；可选方案：CI 里 brew install mpv 后
-#   用 dylibbundler 收集依赖 dylib 一并打进 .app，或引导用户 brew install mpv（现状）。
+# macOS libmpv 使用 media-kit/libmpv-darwin-build 的 LGPL video-default 构建；
+# 更新版本时需同时更新 libmpv_release 与 libmpv_package 中的版本号。

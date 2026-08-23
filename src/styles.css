@@ -267,14 +267,6 @@ body.no-zh .zh.reveal { display: block; }
 }
 #advanced summary { cursor: pointer; padding: 2px 0; }
 
-/* ---------- 迷你条模式（播放时自动收起） ---------- */
-body.mini #sentence-list,
-body.mini #top-bar,
-body.mini #trans-bar,
-body.mini #advanced,
-body.mini #notice-bar,
-body.mini #search-panel { display: none; }
-
 /* ---------- 设置抽屉 ---------- */
 #settings-body {
   flex: 1;

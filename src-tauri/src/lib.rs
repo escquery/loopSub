@@ -47,6 +47,13 @@ const DRAWER_W: f64 = 420.0;
 /// 窗口内持续学习响度，AB 回跳不会重置这段历史，因此同一句每轮增益都可能不同。
 /// acompressor 只保留 180ms 的释放状态：压低峰值后固定补偿约 +9.5dB；limiter
 /// 仅负责兜住瞬态峰值，避免削波。参数不随已播放内容学习，循环响度可重复。
+// media-kit 的 macOS video-default 构建为减小体积只带 FFmpeg equalizer，
+// 不带 acompressor/alimiter；给它下发压缩链会在开始解码后让整条音轨初始化失败。
+// macOS 改用同样可提升对白清晰度、且该构建明确启用的语音频段均衡链。
+#[cfg(target_os = "macos")]
+const DIALOGUE_BOOST_AF: &str =
+    "lavfi=[equalizer=f=180:t=q:w=0.8:g=-3,equalizer=f=2500:t=q:w=1.2:g=4]";
+#[cfg(not(target_os = "macos"))]
 const DIALOGUE_BOOST_AF: &str = "lavfi=[acompressor=threshold=0.125:ratio=3:attack=15:release=180:makeup=3:knee=2.828:detection=rms,alimiter=limit=0.95:attack=5:release=50:level=false]";
 
 /// 重排视频子窗口：顶栏以下、抽屉以左的区域（顺带抬顶——WebView2 异步初始化
@@ -79,6 +86,140 @@ fn relayout_video(app: &tauri::AppHandle) {
     }
 }
 
+/// 把 macOS 控制面板完整约束在当前屏幕的可见工作区；外接显示器拔掉、Dock
+/// 改位置或旧窗口坐标失效时也不会只剩一角露在屏幕外。
+#[cfg(target_os = "macos")]
+fn constrain_macos_panel(app: &tauri::AppHandle, center: bool) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(panel_window_id) = win.ns_window() else {
+        return;
+    };
+    let panel_window_id = panel_window_id as usize;
+    let _ = app.run_on_main_thread(move || unsafe {
+        use objc2_app_kit::NSWindow;
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        let panel = &*(panel_window_id as *const NSWindow);
+        let Some(screen) = panel.screen() else {
+            return;
+        };
+        let area = screen.visibleFrame();
+        let old = panel.frame();
+        let width = old.size.width.min(area.size.width);
+        let height = old.size.height.min(area.size.height);
+        let (x, y) = if center {
+            (
+                area.origin.x + (area.size.width - width) / 2.0,
+                area.origin.y + (area.size.height - height) / 2.0,
+            )
+        } else {
+            (
+                old.origin
+                    .x
+                    .clamp(area.origin.x, area.origin.x + area.size.width - width),
+                old.origin
+                    .y
+                    .clamp(area.origin.y, area.origin.y + area.size.height - height),
+            )
+        };
+        panel.setFrame_display(
+            NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)),
+            true,
+        );
+    });
+}
+
+/// macOS 将独立视频窗与控制面板并排，避免 libmpv 默认居中后两窗重叠。
+/// Cocoa 使用左下角坐标；按较高窗口顶边对齐，并把组合整体置于可见工作区中央。
+#[cfg(target_os = "macos")]
+async fn arrange_macos_windows(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    let panel_window_id = app
+        .get_webview_window("main")
+        .ok_or("主窗口不存在")?
+        .ns_window()
+        .map_err(|e| e.to_string())? as usize;
+    let panel_on_right = matches!(
+        state.settings.lock().unwrap().window.dock_side,
+        settings::DockSide::Right
+    );
+
+    // media-kit 的 mpv 0.36 不提供 window-id 属性；直接从当前进程的 NSApp
+    // windows 中寻找除 Tauri 面板外的可见大窗口，同时也兼容新版 Cocoa VO。
+    for _ in 0..30 {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.run_on_main_thread(move || unsafe {
+            use objc2::MainThreadMarker;
+            use objc2_app_kit::{NSApplication, NSWindow};
+            use objc2_foundation::{NSPoint, NSSize};
+            let panel = &*(panel_window_id as *const NSWindow);
+            let mtm = MainThreadMarker::new().expect("已在 AppKit 主线程");
+            let ns_app = NSApplication::sharedApplication(mtm);
+            let video = ns_app.windows().iter().find(|window| {
+                let ptr = &**window as *const NSWindow as usize;
+                let frame = window.frame();
+                ptr != panel_window_id
+                    && window.isVisible()
+                    && frame.size.width >= 160.0
+                    && frame.size.height >= 90.0
+            });
+            let Some(video) = video else {
+                let _ = tx.send(false);
+                return;
+            };
+            let Some(screen) = video.screen().or_else(|| panel.screen()) else {
+                let _ = tx.send(false);
+                return;
+            };
+            let area = screen.visibleFrame();
+            let gap = 12.0;
+
+            // 面板本身不能高/宽过工作区；低分辨率屏幕上宁可缩小可滚动内容，
+            // 也不能让标题栏或底部控件落在屏幕外。
+            let mut pf = panel.frame();
+            let panel_w = pf.size.width.min(area.size.width);
+            let panel_h = pf.size.height.min(area.size.height);
+            if panel_w != pf.size.width || panel_h != pf.size.height {
+                pf.size = NSSize::new(panel_w, panel_h);
+                panel.setFrame_display(pf, true);
+            }
+
+            // 两窗总宽超过工作区时等比缩小视频窗，始终给控制面板留足位置。
+            let mut vf = video.frame();
+            let max_video_w = (area.size.width - gap - panel_w).max(160.0);
+            let scale = (max_video_w / vf.size.width)
+                .min(area.size.height / vf.size.height)
+                .min(1.0);
+            if scale < 1.0 {
+                vf.size = NSSize::new(vf.size.width * scale, vf.size.height * scale);
+                video.setFrame_display(vf, true);
+            }
+
+            let total_w = vf.size.width + gap + panel_w;
+            let max_h = vf.size.height.max(panel_h);
+            let x = area.origin.x + (area.size.width - total_w).max(0.0) / 2.0;
+            let top = area.origin.y
+                + area.size.height
+                - (area.size.height - max_h).max(0.0) / 2.0;
+            let (video_x, panel_x) = if panel_on_right {
+                (x, x + vf.size.width + gap)
+            } else {
+                (x + panel_w + gap, x)
+            };
+            video.setFrameOrigin(NSPoint::new(video_x, top - vf.size.height));
+            panel.setFrameOrigin(NSPoint::new(panel_x, top - panel_h));
+            let _ = tx.send(true);
+        })
+        .map_err(|e| e.to_string())?;
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(true) => return Ok(()),
+            Ok(false) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            Err(_) => return Err("macOS 窗口布局超时".into()),
+        }
+    }
+    Err("视频窗口尚未就绪".into())
+}
+
 /// 前端形态：Windows = 单窗口（顶栏+抽屉+内嵌视频）；其余平台 = 面板+独立视频窗
 #[tauri::command]
 fn window_mode() -> &'static str {
@@ -93,7 +234,7 @@ fn window_mode() -> &'static str {
 ///（拉伸最大化窗口会退出最大化，反而怪异）。关闭对称收回，带最小宽度保护。
 #[tauri::command]
 fn set_drawer(
-    app: tauri::AppHandle,
+    #[allow(unused_variables)] app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     open: bool,
 ) -> Result<(), String> {
@@ -149,10 +290,11 @@ fn take_startup_video(state: tauri::State<'_, AppState>) -> Option<String> {
 /// 窗口重置为视频原始大小（顶栏 1:1 按钮 / 快捷键）：视频子窗口物理尺寸
 /// 对齐视频显示像素（dwidth/dheight，1:1 不缩放），主窗口按布局反推
 ///（顶栏+进度条+抽屉）。超出当前显示器工作区时等比缩到能放下（不再 1:1）。
-/// set_size 触发 Resized → relayout_video 自动重排视频子窗口。非 Windows 无操作。
+/// set_size 触发 Resized → relayout_video 自动重排视频子窗口；macOS/Linux
+/// 则把 mpv 顶层视频窗的 window-scale 恢复为 1。
 #[tauri::command]
-fn fit_window_to_video(
-    app: tauri::AppHandle,
+async fn fit_window_to_video(
+    #[allow(unused_variables)] app: tauri::AppHandle,
     #[allow(unused_variables)] state: tauri::State<'_, AppState>,
     w: f64,
     h: f64,
@@ -186,7 +328,22 @@ fn fit_window_to_video(
     }
     #[cfg(not(windows))]
     {
-        let _ = (app, w, h);
+        let _ = (w, h);
+        let guard = state.mpv.lock().await;
+        let mpv = guard.as_ref().ok_or("mpv 未在播放")?;
+        // macOS/Linux 使用 mpv 自己的顶层视频窗；window-scale=1 让它按
+        // 视频显示像素恢复为 1:1，mpv 自身负责屏幕边界钳制。
+        mpv.set_property("window-scale", 1.0.into())
+            .await
+            .map_err(|e| e.to_string())?;
+        drop(guard);
+        #[cfg(target_os = "macos")]
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Err(e) = arrange_macos_windows(&app, &state).await {
+                eprintln!("[macos] arrange after 1:1 failed: {e}");
+            }
+        }
     }
     Ok(())
 }
@@ -202,7 +359,10 @@ fn get_explorer_menu() -> bool {
 
 /// 注册/移除资源管理器右键菜单（"用 loopSub 播放"；非 Windows 无操作）
 #[tauri::command]
-fn set_explorer_menu(state: tauri::State<'_, AppState>, enable: bool) -> Result<(), String> {
+fn set_explorer_menu(
+    #[allow(unused_variables)] state: tauri::State<'_, AppState>,
+    enable: bool,
+) -> Result<(), String> {
     #[cfg(windows)]
     {
         let r = if enable {
@@ -226,7 +386,7 @@ fn set_explorer_menu(state: tauri::State<'_, AppState>, enable: bool) -> Result<
 
 /// 前端就绪（DOMContentLoaded）：WebView2 初始化完成后抬顶+重排视频子窗口
 #[tauri::command]
-fn webview_ready(app: tauri::AppHandle) {
+fn webview_ready(#[allow(unused_variables)] app: tauri::AppHandle) {
     #[cfg(windows)]
     {
         let app2 = app.clone();
@@ -329,9 +489,17 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
-fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<(), String> {
+async fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<(), String> {
     settings.save(&state.settings_path).map_err(|e| e.to_string())?;
+    let hotkeys = settings.hotkeys.clone();
     *state.settings.lock().unwrap() = settings;
+    // 独立视频窗（macOS/Linux）也要实时拿到改绑后的按键；绑定失败不影响
+    // 设置落盘，下一次创建 mpv 实例时还会再同步。
+    if let Some(mpv) = state.mpv.lock().await.as_ref() {
+        if let Err(e) = mpv.bind_hotkeys(&hotkeys).await {
+            eprintln!("[hotkeys] rebind failed: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -339,13 +507,21 @@ fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Resul
 
 /// 加载 SRT 字幕；规则法大写还原开启时对每句做 truecase
 #[tauri::command]
-fn load_srt(state: tauri::State<'_, AppState>, path: String) -> Result<Vec<subtitle::SubtitleLine>, String> {
+async fn load_srt(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<Vec<subtitle::SubtitleLine>, String> {
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let mut lines = subtitle::parse_srt(&content).map_err(|e| e.to_string())?;
     if state.rule_truecase() {
         for line in &mut lines {
             line.text = subtitle::truecase(&line.text);
         }
+    }
+    // 已在播放时手动 SRT 也挂为活动轨；未播放时仍允许先载入句子列表。
+    let mpv_connected = { state.mpv.lock().await.is_some() };
+    if mpv_connected {
+        attach_subtitle_track(&state, std::path::Path::new(&path)).await?;
     }
     Ok(lines)
 }
@@ -399,6 +575,13 @@ async fn mpv_start_internal(state: &AppState, app: &tauri::AppHandle) -> Result<
 
     let embed = mpv::embed::MpvEmbed::new(api, layout, app)?;
     let m = Mpv::Embed(embed);
+
+    // macOS/Linux 的 mpv 是独立原生窗口，获得焦点后 WebView 收不到 keydown；
+    // 将同一份用户快捷键绑定进 mpv，事件线程再转发给前端动作表。
+    let hotkeys = state.settings.lock().unwrap().hotkeys.clone();
+    if let Err(e) = m.bind_hotkeys(&hotkeys).await {
+        eprintln!("[hotkeys] initial bind failed: {e}");
+    }
 
     let audio = state.audio();
     if audio.dialogue_boost {
@@ -457,7 +640,12 @@ async fn mpv_quit(state: tauri::State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn mpv_connect(state: tauri::State<'_, AppState>, socket_path: String) -> Result<(), String> {
     let ipc = MpvIpc::connect(&socket_path).await.map_err(|e| e.to_string())?;
-    *state.mpv.lock().await = Some(Mpv::Ipc(ipc));
+    let mpv = Mpv::Ipc(ipc);
+    let hotkeys = state.settings.lock().unwrap().hotkeys.clone();
+    if let Err(e) = mpv.bind_hotkeys(&hotkeys).await {
+        eprintln!("[hotkeys] IPC bind failed: {e}");
+    }
+    *state.mpv.lock().await = Some(mpv);
     Ok(())
 }
 
@@ -473,6 +661,49 @@ async fn mpv_command(
 }
 
 // ---------- 视频加载管线 ----------
+
+/// 把解析/下载得到的 SRT 挂为 mpv 当前字幕轨。即使字幕由面板渲染也必须挂载：
+/// 上一句/下一句依赖 mpv sub-seek；可见性只决定画面是否由 mpv 重复绘制。
+/// loadfile 的 demuxer 异步打开，轮询 duration 至就绪后再 sub-add。
+async fn attach_subtitle_track(state: &AppState, path: &std::path::Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let visible = true;
+    #[cfg(not(windows))]
+    let visible = !state.panel_render();
+
+    let path = path.to_string_lossy().into_owned();
+    let mut last_error = "播放器尚未就绪".to_string();
+    for _ in 0..50 {
+        {
+            let guard = state.mpv.lock().await;
+            let Some(mpv) = guard.as_ref() else {
+                return Err("mpv 未连接".into());
+            };
+            match mpv.get_property("duration").await {
+                Ok(v) if v.as_f64().unwrap_or(0.0) > 0.0 => {
+                    mpv.set_property("sub-visibility", visible.into())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    match mpv
+                        .command(vec![
+                            "sub-add".into(),
+                            path.clone().into(),
+                            "select".into(),
+                        ])
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(e) => last_error = e.to_string(),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => last_error = e.to_string(),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(format!("字幕轨挂载失败: {last_error}"))
+}
 
 /// 加载视频：moviehash → 缓存命中直接用；否则 ffprobe 探测 + ffmpeg 提取内嵌
 /// 文本字幕到缓存目录；最后拉起 mpv 播放。无内嵌文本轨时降级为 notice，
@@ -549,19 +780,36 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
     {
         let guard = state.mpv.lock().await;
         let ipc = guard.as_ref().unwrap();
-        let args = if resume >= 5.0 {
-            vec![
+        if resume >= 5.0 {
+            let start = format!("start={resume:.3}");
+            // mpv 0.40+：loadfile <url> <flags> <index> <options>；当前随包的
+            // 0.36：loadfile <url> <flags> <options>。先试新签名，遇到旧版的
+            // MPV_ERROR_INVALID_PARAMETER(-4) 再用旧签名，避免有续播记录的视频打不开。
+            let modern = vec![
                 "loadfile".into(),
                 path.clone().into(),
                 "replace".into(),
                 (-1).into(),
-                // options 以 "key=value" 字符串下发，libmpv argv 与 JSON IPC 均如此解析
-                format!("start={resume:.3}").into(),
-            ]
+                start.clone().into(),
+            ];
+            if let Err(modern_err) = ipc.command(modern).await {
+                let legacy = vec![
+                    "loadfile".into(),
+                    path.clone().into(),
+                    "replace".into(),
+                    start.into(),
+                ];
+                ipc.command(legacy).await.map_err(|legacy_err| {
+                    format!(
+                        "加载视频失败（新旧 loadfile 参数均被拒绝）: {modern_err}; {legacy_err}"
+                    )
+                })?;
+            }
         } else {
-            vec!["loadfile".into(), path.clone().into()]
-        };
-        ipc.command(args).await.map_err(|e| e.to_string())?;
+            ipc.command(vec!["loadfile".into(), path.clone().into()])
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         // 面板形态（非 Windows）：字幕由面板 mini-bar 渲染，mpv 侧关字幕防双显
         #[cfg(not(windows))]
         if state.panel_render() {
@@ -576,42 +824,27 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
         let _ = app.run_on_main_thread(move || relayout_video(&app2));
     }
 
-    // 单窗口形态（Windows）画面字幕交给 mpv 渲染（字幕条已退役、句子列表收在抽屉里）。
-    // demuxer 异步打开，未就绪时 sub-add 会被拒（mpv error -12）：轮询 duration 至就绪
-    // （上界 5s）再挂轨；每次循环锁内仅一次查询，sleep 在锁外不挡前端播放轮询
-    #[cfg(windows)]
+    // 所有平台都挂载同一份已解析字幕。macOS/Linux 默认由面板绘制，后端会
+    // 把 sub-visibility 设为 false，但仍保留活动轨供 sub-seek/延迟/速度使用。
     if source != "none" {
-        // 挂载路径：truecase 开启且有还原文件时用还原版，否则 originals 原文
         let sub_path = if state.rule_truecase() {
             let tc = cache.truecased_path(hash);
             if tc.exists() { tc } else { original.clone() }
         } else {
             original.clone()
         };
-        let mut attached = false;
-        for _ in 0..50 {
-            {
-                let guard = state.mpv.lock().await;
-                if let Some(ipc) = guard.as_ref() {
-                    if let Ok(v) = ipc.get_property("duration").await {
-                        if v.as_f64().unwrap_or(0.0) > 0.0 {
-                            let _ = ipc.set_property("sub-visibility", true.into()).await;
-                            attached = ipc
-                                .command(vec![
-                                    "sub-add".into(),
-                                    sub_path.to_string_lossy().into_owned().into(),
-                                    "select".into(),
-                                ])
-                                .await
-                                .is_ok();
-                        }
-                    }
-                }
-            }
-            if attached {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        attach_subtitle_track(&state, &sub_path).await?;
+    }
+
+    // libmpv 的 Cocoa 视频窗初始化时会主动成为 key window；先把两窗并排，再把
+    // 输入焦点还给学习面板。用户之后点视频窗时由 mpv-hotkey 桥继续接管快捷键。
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(e) = arrange_macos_windows(&app, &state).await {
+            eprintln!("[macos] arrange windows failed: {e}");
+        }
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.set_focus();
         }
     }
 
@@ -681,27 +914,14 @@ async fn download_subtitle(
         // 画面字幕同步用还原版（同 load_video）；写失败则挂载处回落 originals
         let _ = std::fs::write(cache.truecased_path(hash), subtitle::to_srt(&lines));
     }
-    // 单窗口形态（Windows）：正在播放时挂给 mpv 渲染画面字幕（此时 demuxer 已就绪）
-    #[cfg(windows)]
-    {
-        let sub_path = if state.rule_truecase() {
-            let tc = cache.truecased_path(hash);
-            if tc.exists() { tc } else { cache.original_path(hash) }
-        } else {
-            cache.original_path(hash)
-        };
-        let guard = state.mpv.lock().await;
-        if let Some(ipc) = guard.as_ref() {
-            let _ = ipc.set_property("sub-visibility", true.into()).await;
-            let _ = ipc
-                .command(vec![
-                    "sub-add".into(),
-                    sub_path.to_string_lossy().into_owned().into(),
-                    "select".into(),
-                ])
-                .await;
-        }
-    }
+    // 正在播放时立即挂载；面板模式隐藏画面字幕，但保留活动轨供 sub-seek。
+    let sub_path = if state.rule_truecase() {
+        let tc = cache.truecased_path(hash);
+        if tc.exists() { tc } else { cache.original_path(hash) }
+    } else {
+        cache.original_path(hash)
+    };
+    attach_subtitle_track(&state, &sub_path).await?;
     Ok(lines)
 }
 
@@ -839,12 +1059,12 @@ async fn recall_mpv(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if matches!(state.mpv.lock().await.as_ref(), Some(Mpv::Ipc(_)) | None) {
-        return Err("mpv 未在播放（手动连接模式不支持召回）".into());
-    }
-    let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
     #[cfg(windows)]
     {
+        if matches!(state.mpv.lock().await.as_ref(), Some(Mpv::Ipc(_)) | None) {
+            return Err("mpv 未在播放（手动连接模式不支持召回）".into());
+        }
+        let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
         // recall_mpv 是 async 命令：等 mpv 锁期间用户可能已经切走。真正执行
         // 召回前必须在主线程重验前台窗口，否则迟到的 set_focus 会抢回焦点。
         app.run_on_main_thread(move || {
@@ -860,8 +1080,46 @@ async fn recall_mpv(
         .map_err(|e| e.to_string())?;
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
+        if !matches!(state.mpv.lock().await.as_ref(), Some(Mpv::Embed(_))) {
+            return Err("mpv 未在播放（手动连接模式不支持召回）".into());
+        }
+        let panel_window_id = app
+            .get_webview_window("main")
+            .ok_or("主窗口不存在")?
+            .ns_window()
+            .map_err(|e| e.to_string())? as usize;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.run_on_main_thread(move || {
+            use objc2::MainThreadMarker;
+            use objc2_app_kit::{NSApplication, NSWindow};
+            let mtm = MainThreadMarker::new().expect("已在 AppKit 主线程");
+            let ns_app = NSApplication::sharedApplication(mtm);
+            let found = ns_app.windows().iter().find(|window| {
+                let ptr = &**window as *const NSWindow as usize;
+                let frame = window.frame();
+                ptr != panel_window_id && frame.size.width >= 160.0 && frame.size.height >= 90.0
+            });
+            if let Some(window) = found {
+                window.makeKeyAndOrderFront(None);
+                let _ = tx.send(true);
+            } else {
+                let _ = tx.send(false);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(true) => Ok(()),
+            _ => Err("视频窗口尚未就绪".into()),
+        }
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        if state.mpv.lock().await.is_none() {
+            return Err("mpv 未在播放".into());
+        }
+        let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
         let _ = win.unminimize();
         let _ = win.show();
         win.set_focus().map_err(|e| e.to_string())
@@ -1162,6 +1420,7 @@ pub fn run() {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("loopsub")
         .join("settings.json");
+    #[allow(unused_mut)]
     let mut settings = Settings::load(&settings_path).unwrap_or_default();
     // 资源管理器右键菜单默认开启：首次启动（未做过选择）注册并记忆；之后每次
     // 启动按设置状态与注册表对齐（重写一遍顺带修复便携版移动后的路径漂移）
@@ -1190,8 +1449,17 @@ pub fn run() {
             // webview 窗口；面板没了，视频窗口就成了没有控制端的孤儿（进程也不退）
             if let Some(main_win) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
+                #[cfg(target_os = "macos")]
+                let event_win = main_win.clone();
                 main_win.on_window_event(move |event| {
                     match event {
+                        // macOS 红色关闭按钮按平台惯例只隐藏窗口；否则最后一个
+                        // Tauri 窗口销毁后 Dock 中仍有进程，却没有窗口可重新打开。
+                        #[cfg(target_os = "macos")]
+                        tauri::WindowEvent::CloseRequested { api, .. } => {
+                            api.prevent_close();
+                            let _ = event_win.hide();
+                        }
                         tauri::WindowEvent::Destroyed => {
                             eprintln!("[win-event] main destroyed, shutdown mpv");
                             let state = app_handle.state::<AppState>();
@@ -1212,6 +1480,9 @@ pub fn run() {
                     }
                 });
             }
+            #[cfg(target_os = "macos")]
+            constrain_macos_panel(app.handle(), true);
+
             // 视频渲染子窗口样式看门狗（Windows）：mpv 会异步创建内部子窗口，
             // 定期补上禁用与命中穿透。这里只处理子窗口样式，绝不调用 set_focus
             // 或调整主窗口 Z 序；鼠标与 Alt+Tab 全部交给 Windows 正常处理。
@@ -1301,7 +1572,39 @@ pub fn run() {
 
     // 退出时销毁 libmpv 实例（terminate_destroy 触发并等待 core 退出）
     app.run(|handle, event| {
-        if matches!(event, tauri::RunEvent::Exit) {
+        #[cfg(target_os = "macos")]
+        match &event {
+            // 点击 Dock 图标恢复被红色关闭按钮隐藏的学习面板。
+            tauri::RunEvent::Reopen { .. } => {
+                constrain_macos_panel(handle, false);
+                if let Some(win) = handle.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+            // Finder 的“打开方式”/拖到 Dock 图标会以 file:// URL 到达；既存入
+            // pending 供冷启动消费，也发事件覆盖应用已运行的情况。
+            tauri::RunEvent::Opened { urls } => {
+                if let Some(path) = urls
+                    .iter()
+                    .filter_map(|url| url.to_file_path().ok())
+                    .find(|path| path.is_file())
+                {
+                    let path = path.to_string_lossy().into_owned();
+                    constrain_macos_panel(handle, false);
+                    let state = handle.state::<AppState>();
+                    *state.pending_video.lock().unwrap() = Some(path.clone());
+                    if let Some(win) = handle.get_webview_window("main") {
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
+                    let _ = handle.emit("open-video", path);
+                }
+            }
+            _ => {}
+        }
+
+        if matches!(&event, tauri::RunEvent::Exit) {
             let state = handle.state::<AppState>();
             // 同 Destroyed：try_lock，拿不到就由 OS 回收（下一行 process::exit 反正强退）
             let g = state.mpv.try_lock();
