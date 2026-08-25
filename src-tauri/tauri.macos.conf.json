@@ -1,16 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
-        "title": "loopSub 控制面板",
-        "width": 440,
-        "height": 680,
+        "title": "loopSub",
+        "width": 1280,
+        "height": 764,
         "center": true,
-        "minWidth": 360,
-        "minHeight": 300,
+        "minWidth": 800,
+        "minHeight": 500,
         "alwaysOnTop": false,
+        "transparent": true,
         "resizable": true
       }
     ]

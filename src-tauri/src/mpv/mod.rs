@@ -7,6 +7,9 @@
 //! 每行一个 JSON；带 request_id 的是响应，其余是 event。
 
 pub mod embed;
+/// macOS：libmpv Render API → AppKit NSOpenGLView
+#[cfg(target_os = "macos")]
+pub mod render_macos;
 /// 自建视频窗口（Phase B，仅 Windows）
 #[cfg(windows)]
 pub mod vidwin;

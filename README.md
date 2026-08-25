@@ -1,27 +1,27 @@
 # loopSub
 
-用字幕驱动美剧学习的播放器：Windows 单窗口内嵌 libmpv，macOS 使用轻量控制面板 + 原生视频窗；逐句跳转 / AB 复读 / 跟读暂停 / 字幕搜索与对齐 / LLM 翻译 / Anki 制卡一体化。
+用字幕驱动美剧学习的播放器：Windows 与 macOS 均为单窗口内嵌 libmpv；逐句跳转 / AB 复读 / 跟读暂停 / 字幕搜索与对齐 / LLM 翻译 / Anki 制卡一体化。
 
 > 目标平台：Windows、macOS ｜ 技术栈：Tauri 2 + Rust + 纯静态前端（无 node 依赖）
 
 ## 核心理念
 
-**Windows 下 libmpv 是不接收输入的纯显示层；macOS 独立视频窗获得焦点时，快捷键由 libmpv 转发回 loopSub 动作表。**
+**libmpv 是不接收输入的原生显示层，Tauri WebView 是唯一交互层。**
 
 ```text
-Windows：
+Windows / macOS：
 ┌─ loopSub 主窗口（唯一窗口、唯一焦点） ─────────────┐
 │  顶栏  📂 🕘 🔍 ⚙ 1:1                              │
 │  ┌────────────────────────────┐ ┌────────────────┐ │
-│  │ 视频区（自建子窗口内嵌，    │ │ 字幕列表抽屉    │ │
-│  │ libmpv 渲染，被动显示）     │ │（展开窗口右扩） │ │
+│  │ 视频区（Windows HWND /      │ │ 字幕列表抽屉    │ │
+│  │ macOS Render API + OpenGL） │ │（macOS 常驻）   │ │
 │  └────────────────────────────┘ └────────────────┘ │
 └────────────────────────────────────────────────────┘
 loopSub ──dlopen──> libmpv         （播放控制全部进程内调用）
 loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 ```
 
-由此不需要全局热键。libmpv 以 dlopen 方式进程内加载（无子进程、无 IPC 连接与重试），以 `osc=no input-default-bindings=no` 初始化；Windows 视频区为应用自建 Win32 子窗口，macOS 则由 libmpv 创建原生视频窗，并用专用 input section 把快捷键动作转回控制面板。
+由此不需要全局热键。libmpv 以 dlopen 方式进程内加载（无子进程、无 IPC 连接与重试），以 `osc=no input-default-bindings=no` 初始化；Windows 输出到自建 Win32 子窗口，macOS 通过 libmpv Render API 输出到主窗口内的 Retina `NSOpenGLView`，并启用 VideoToolbox 硬件解码。
 
 ## 功能
 
@@ -30,7 +30,7 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 - AB 区间循环、单句循环、A/B 点 100ms 级微调
 - 跟读模式（句末自动暂停）、0.25–3.0x 变速
 - 字幕延迟微调（±0.1s / ±0.5s，按视频 hash 记忆）
-- 对白增强（固定参数短时压缩 + 峰值限制，AB 循环中增益不会随历史漂移）
+- 对白增强（Windows 使用短时压缩，macOS 使用轻量 libmpv 支持的语音频段均衡）
 
 **字幕获取管线**
 - 内嵌字幕：`ffprobe` 探测 → `ffmpeg` 导出文本轨（图形轨 PGS/VobSub 自动识别并提示）
@@ -48,12 +48,12 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 - Anki 一键制卡（`K`：当前句截图 + 音频切片 + 双语文本 → AnkiConnect；Anki 未启动时兜底导出文件）
 - 最近播放历史（MRU 20 条，失效自动剔除）+ 播放位置记忆（≥5s 自动续播）
 - 常亮状态徽章（AB / 跟读 / 译文 / 速度 / 延迟），点击即关闭
-- macOS 字幕控制面板始终完整展开并常驻，不随播放/暂停自动缩放
+- macOS 单窗口右侧字幕面板始终完整展开并常驻，不随播放/暂停自动缩放
 
 **窗口与系统集成**
 - 失焦自动沉底、切回自动召回与置顶（均可在设置页关闭）
 - `1:1` 窗口适配视频原始画面（含 DPI 缩放与工作区边界收缩）
-- 字幕抽屉展开时窗口向右扩 420px，视频画面像素位置不动
+- Windows 字幕抽屉按需展开；macOS 右侧 420px 字幕面板默认常驻
 - 资源管理器右键菜单「用 loopSub 播放」（Windows，默认开启；HKCU 按 20 个视频扩展名注册，免管理员，设置页可关）
 
 ## 安装

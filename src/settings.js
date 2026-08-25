@@ -4,8 +4,8 @@
 
 // 键盘事件 → 规范化组合键，与 Rust 默认表格式一致：
 // 修饰键顺序 ctrl → alt → shift → meta；单字符小写；空格记为 Space；
-// Shift+符号键按物理键（e.code）归一为基键字符——Shift+[ 的 e.key 是 {，
-// 绑定表统一记基键形式 shift+[（美式物理键位）
+// 符号键按物理键（e.code）归一为基键字符——Shift+[ 的 e.key 是 {，而
+// macOS 拼音输入法下裸 [ 也可能是【；绑定表统一记美式物理键位的 [。
 const SHIFT_BASE_KEYS = {
   BracketLeft: '[', BracketRight: ']', Comma: ',', Period: '.', Slash: '/',
   Backslash: '\\', Semicolon: ';', Quote: "'", Minus: '-', Equal: '=', Backquote: '`',
@@ -20,7 +20,9 @@ window.comboOf = function (e) {
   if (e.metaKey) parts.push('meta');
   let key = e.key;
   if (key === ' ') key = 'Space';
-  else if (e.shiftKey && SHIFT_BASE_KEYS[e.code]) key = SHIFT_BASE_KEYS[e.code];
+  // 标点键始终按物理键位归一。macOS 拼音输入法下裸 [ / ] 的 e.key 可能是
+  // 全角【/】，此前只有带 Shift 时才归一，导致设置 A/B 无响应而取消却正常。
+  else if (SHIFT_BASE_KEYS[e.code]) key = SHIFT_BASE_KEYS[e.code];
   else if (key.length === 1) key = key.toLowerCase();
   parts.push(key);
   return parts.join('+');

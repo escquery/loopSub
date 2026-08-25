@@ -307,7 +307,9 @@ body.no-zh .zh.reveal { display: block; }
   border-top: 1px solid #3a3d44;
 }
 
-/* ---------- 单窗口模式（Windows：mpv 画面内嵌主窗口，学习面板收进右侧抽屉） ---------- */
+/* ---------- 单窗口模式（Windows HWND / macOS OpenGL Render API） ---------- */
+/* macOS 视频开始后把 WKWebView 的画面区透出给 NSOpenGLView；首次打开前仍为深色。 */
+body.single.fixed-panel.video-rendering { background: transparent; }
 body.single #top-bar {
   position: fixed;
   top: 0;

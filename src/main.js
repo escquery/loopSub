@@ -55,6 +55,7 @@ const osd = (text) => mpv('show-text', String(text), 1200);
 
 function markConnected() {
   state.connected = true;
+  if (fixedPanel) document.body.classList.add('video-rendering');
   $('#conn-status').textContent = '已连接';
   $('#conn-status').classList.add('ok');
 }
@@ -771,15 +772,15 @@ const actions = {
   sub_delay_minus_coarse: () => adjustSubDelay(-0.5),
   sub_delay_plus_coarse: () => adjustSubDelay(0.5),
   sub_delay_reset: () => adjustSubDelay(0, true),
-  // macOS 控制面板始终完整常驻；该动作只保留给 Windows 字幕抽屉。
-  toggle_panel: () => { if (singleMode) toggleDrawer(); },
+  // macOS Render API 单窗口中的字幕抽屉固定常驻；只允许 Windows 收起。
+  toggle_panel: () => { if (singleMode && !fixedPanel) toggleDrawer(); },
   recall_mpv: () => invoke('recall_mpv').then(() => osd('已召回 mpv')).catch(osd),
   fit_video_window: () => fitVideoWindow(),
   anki_export: () => exportAnki(),
 };
 
-// macOS/Linux 的 mpv 视频窗获得焦点时，libmpv input section 将动作名通过
-// client-message → Tauri 事件送回这里，因此与 WebView keydown 共用同一动作表。
+// Linux/手动 IPC 的独立 mpv 窗获得焦点时，input section 将动作名通过
+// client-message → Tauri 事件送回这里，与 WebView keydown 共用动作表。
 listen('mpv-hotkey', (e) => {
   const action = String(e.payload ?? '');
   if (action && actions[action]) actions[action]();
@@ -863,6 +864,7 @@ async function fitVideoWindow() {
 // ---------- 窗口行为：失焦沉底 / 切回召回 mpv ----------
 // 必须在异步注册 focus listener 前初始化，避免监听刚装好就回调时落入 TDZ。
 let singleMode = false;
+let fixedPanel = false;
 let drawerOpen = false;
 let blurredAt = 0;
 listen('tauri://blur', () => {
@@ -883,7 +885,7 @@ listen('tauri://focus', () => {
   invoke('recall_mpv').catch(() => {}); // mpv 未拉起时静默忽略
 });
 
-// ---------- 单窗口模式（Windows：mpv 画面内嵌主窗口，学习面板收进右侧抽屉） ----------
+// ---------- 单窗口模式（Windows HWND / macOS libmpv Render API） ----------
 function toggleDrawer() {
   drawerOpen = !drawerOpen;
   $('#drawer').classList.toggle('hidden', !drawerOpen);
@@ -893,7 +895,9 @@ function toggleDrawer() {
 
 async function initWindowMode() {
   try {
-    singleMode = (await invoke('window_mode')) === 'single';
+    const mode = await invoke('window_mode');
+    singleMode = mode === 'single' || mode === 'single-fixed';
+    fixedPanel = mode === 'single-fixed';
   } catch { return; }
   // 命令行参数和 macOS Finder Opened 冷启动路径在所有窗口形态都要消费；
   // 旧逻辑位于 singleMode 分支内，导致 macOS 收到路径后永远不打开。
@@ -909,6 +913,7 @@ async function initWindowMode() {
   // focus 事件或旧逻辑留下的 topmost 状态，保证鼠标与 Alt+Tab 行为一致。
   invoke('set_always_on_top', { flag: false }).catch(() => {});
   document.body.classList.add('single');
+  if (fixedPanel) document.body.classList.add('fixed-panel');
   // 面板元素搬入右侧抽屉（事件绑在元素上，搬移后保留）；通知条进抽屉顶部
   const drawer = $('#drawer');
   drawer.appendChild($('#notice-bar'));
@@ -919,14 +924,21 @@ async function initWindowMode() {
   $('#top-bar').insertBefore($('#transport'), $('#pos-time'));
   $('#pos-time').classList.remove('hidden');
   const bp = $('#btn-panel');
-  bp.classList.remove('hidden');
-  bp.addEventListener('click', toggleDrawer);
+  if (fixedPanel) {
+    drawerOpen = true;
+    drawer.classList.remove('hidden');
+    document.body.classList.add('drawer-open');
+    await invoke('set_drawer', { open: true }).catch(() => {});
+  } else {
+    bp.classList.remove('hidden');
+    bp.addEventListener('click', toggleDrawer);
+  }
   // 搜索/设置/历史的面板都在抽屉里：抽屉关着时点这些入口先自动开抽屉
   //（捕获阶段先执行，原处理逻辑照常走）
   for (const sel of ['#btn-history', '#btn-open-search', '#btn-settings']) {
     $(sel).addEventListener('click', () => { if (!drawerOpen) toggleDrawer(); }, true);
   }
-  // 通知 Rust 侧 webview 已就绪：抬升并重排 mpv 子窗口
+  // 通知 Rust 侧 webview 已就绪：重排 HWND / NSOpenGLView 视频层
   invoke('webview_ready').catch(() => {});
   // 右键菜单“用 loopSub 播放”带入的启动视频
   if (startup) loadVideo(startup);

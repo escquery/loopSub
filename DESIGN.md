@@ -13,46 +13,26 @@
 
 ## 2. 总体架构：焦点模型
 
-**核心决策：mpv 永远不获得焦点，它是纯显示器；用户的程序面板是唯一交互窗口。**
+**核心决策：Windows 与 macOS 都只有一个顶层窗口；libmpv 是不接收输入的原生显示层，WebView 是唯一交互层。**
 
-```
-┌────────────────────────────────────┐
-│  mpv 窗口（最大化当背景，被动显示） │
-│                                    │
-│         ┌───────────────┐          │
-│         │ loopSub 面板   │ ← 唯一焦点│
-│         │ (always-on-top)│          │
-│         └───────────────┘          │
-└────────────────────────────────────┘
-
-loopSub ──JSON IPC (Unix socket / Named Pipe)──> mpv
-loopSub ──sidecar──> ffmpeg / ffprobe（字幕探测与导出）
-```
-
-由此带来的简化：
-
-- 不需要全局热键：所有按键都是面板内普通 web `keydown` 事件
-- 悬浮面板不需要 click-through 杂技（面板本来就是用来交互的）
-- mpv 被彻底缴械，启动参数：
-
-```bash
-mpv --idle=yes --force-window \
-    --input-ipc-server=<socket路径> \
-    --no-osc \
-    --no-input-default-bindings \
-    --keep-open=yes \
-    --sid=no --secondary-sid=no
+```text
+┌─ loopSub 主窗口 ─────────────────────────────┐
+│ 顶栏 / 播放控制                              │
+│ ┌──────────────────────┐ ┌────────────────┐ │
+│ │ 原生视频层            │ │ 字幕学习面板    │ │
+│ │ Windows: HWND + wid   │ │ macOS: 常驻     │ │
+│ │ macOS: Render API+GL  │ │ Windows: 抽屉   │ │
+│ └──────────────────────┘ └────────────────┘ │
+└──────────────────────────────────────────────┘
+loopSub ──dlopen──> libmpv
+loopSub ──spawn──> ffmpeg / ffprobe
 ```
 
-### 层级与焦点规则
-
-- 目标层级永远为 **面板 > mpv > 其他窗口**
-- 面板 always-on-top 与焦点无关；切走再切回时，**程序主动召回 mpv**（提升到面板正下方）：
-  - Windows：按 PID 枚举 mpv 窗口句柄，`SetWindowPos(hwnd, HWND_TOP, ...)`
-  - macOS：激活 mpv 进程后立即把焦点还给面板（有一瞬闪烁）；兜底为面板上的"召回视频窗口"按钮 + 快捷键
-  - 防抖：离开超过 ~2s 才触发；mpv 被最小化时不召回
-- 失焦去无关应用时自动取消面板 topmost（`set_always_on_top`），回来自动恢复——避免悬浮条挂在所有窗口上
-- macOS 原生 fullscreen 会创建独立 Space 导致悬浮窗失效 → 用 `window-maximized` 代替 fullscreen
+- 默认播放控制直接调用进程内 libmpv Client API；JSON IPC 只保留手动连接模式。
+- Windows 由 mpv 渲染到自建 HWND 子窗口。
+- macOS 创建透明 WKWebView + `NSOpenGLView`，libmpv Render API 绘制 Retina framebuffer；更新回调只投递 AppKit 主线程，VideoToolbox 负责硬解。
+- 视频层避开 44px 顶栏、14px 进度条与右侧字幕面板，不参与鼠标和键盘输入。
+- 主窗口关闭时整个进程退出，因此不会遗留独立 mpv 窗口或焦点问题。
 
 ### 三种状态三种界面
 
@@ -62,13 +42,13 @@ mpv --idle=yes --force-window \
 | 暂停 | 面板尺寸不变，继续显示句子列表与操作按钮 |
 | 浏览 | 主面板：全量句子列表 / 搜索 / 翻译管理 / 设置 |
 
-## 3. mpv 控制（JSON IPC）
+## 3. mpv 控制（Client API；手动模式兼容 JSON IPC）
 
-- 传输层：mac/Linux 用 Unix socket，Windows 用命名管道 `\\.\pipe\loopsub-mpv`，JSON 协议一致；Rust 侧 `cfg` 分支封装（tokio UnixStream / named_pipe）
-- 消息：command / response / event（`observe_property` 订阅推送）
-- 由程序以子进程拉起 mpv，生命周期随应用
+- 默认：同进程 `mpv_command` / `mpv_get_property` / `mpv_set_property`。
+- 手动连接外部 mpv 时：mac/Linux Unix socket、Windows 命名管道。
+- libmpv handle、RenderContext 和原生视频层生命周期均随主窗口。
 
-### 功能 → IPC 映射
+### 功能 → 命令映射
 
 | 功能 | 实现 |
 |---|---|
@@ -81,7 +61,7 @@ mpv --idle=yes --force-window \
 | 译文显隐 | `secondary-sid` 切换（mpv 渲染模式下） |
 | 字幕延迟微调 | `sub-delay` / `secondary-sub-delay`（双轨默认联动） |
 | 瞬态反馈 | `show-text "..." 1000` 显示在视频画面上 |
-| 对白增强 | `lavfi` 短时固定参数压缩器 + 峰值限制（避免 AB 循环增益漂移） |
+| 对白增强 | Windows：短时压缩 + limiter；macOS 轻量包：语音频段 equalizer |
 | 状态同步 | 订阅 `pause` / `time-pos` / `duration` / `eof-reached` / `sub-start` / `sub-end` |
 
 **当前句判定不依赖 mpv**：订阅 `time-pos` 在程序自己的句子表里反查
@@ -200,7 +180,7 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| 对白增强（短时压缩 + limiter） | 开 | 固定参数压缩并补偿增益，不使用会跨 AB 循环学习响度的 dynaudnorm |
+| 对白增强 | 开 | Windows 固定参数压缩；macOS 使用轻量包内置 equalizer，均不跨 AB 学习历史响度 |
 | 音量上限 | 关闭 | 可选 150%/200%（`volume-max`） |
 | 中置声道提升 | 关（进阶） | 5.1 片源 `pan` 滤镜加权 FC 进立体声 |
 
@@ -233,7 +213,7 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 
 | | Windows | macOS | WSL（开发） |
 |---|---|---|---|
-| 播放控制 | 进程内 libmpv（Win32 子窗口） | 进程内 libmpv（Cocoa 视频窗 + Tauri 面板） | 手动 IPC / 系统 mpv |
+| 播放控制 | 进程内 libmpv（Win32 子窗口） | 进程内 libmpv（Render API + NSOpenGLView） | 手动 IPC / 系统 mpv |
 | mpv/ffmpeg 分发 | 内置 DLL + 绿色 exe | 内置同架构 dylib + 静态可执行文件 | 系统安装 |
 | 出包 | GitHub Actions `windows-latest` | `macos-latest` ARM + `macos-15-intel` | 不出包 |
 | WebView | WebView2 (Chromium) | WKWebView | WebKitGTK（≈mac 预览） |
@@ -245,4 +225,4 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 
 - **v1（闭环）✅ 已完成**：面板遥控 mpv（播放/seek/速度/AB/单句循环/跟读）+ 内嵌字幕导出 + 句子列表（点击跳转/多选复制英文）+ 快捷键 + 设置页（含音频、热键改绑）+ 窗口行为（失焦沉底/切回召回 mpv）
 - **v1.5 ✅ 已完成**：OpenSubtitles 搜索（moviehash 精确 + 文件名解析回退）+ LLM 翻译管线（两级分块/摘要链/术语表防伪/错误明细重试）+ 缓存 + 译文显隐
-- **v2 ✅ 已完成**：进程内 libmpv；Windows 单窗口内嵌；macOS Cocoa 视频窗与完整常驻控制面板并排、AppKit 零权限召回、视频窗快捷键回传；翻译并发与断点续翻；字幕自动对齐；Anki 导出；Windows/macOS 安装包内置同架构 libmpv、ffmpeg 与 ffprobe。
+- **v2 ✅ 已完成**：进程内 libmpv；Windows HWND 单窗口内嵌；macOS Render API + OpenGL 单窗口内嵌及常驻字幕面板；翻译并发与断点续翻；字幕自动对齐；Anki 导出；Windows/macOS 安装包内置同架构 libmpv、ffmpeg 与 ffprobe。

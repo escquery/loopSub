@@ -1,6 +1,6 @@
-//! libmpv 进程内嵌入（Phase A）：dlopen libmpv-2.dll，直接调 C API。
-//! 视频窗口仍由 mpv 自己创建，行为与外部 mpv.exe 一致；变化的是通信方式：
-//! 无命名管道连接/重试、无外部子进程、命令同步返回。
+//! libmpv 进程内嵌入：dlopen 动态库并直接调用 Client API。
+//! Windows 通过 wid 输出到自建 HWND；macOS 通过 Render API 输出到
+//! `NSOpenGLView`；均无命名管道连接/重试和外部 mpv 子进程。
 //!
 //! 手动连接外部已运行 mpv 的模式仍走 [`crate::mpv::MpvIpc`]，不受影响。
 //!
@@ -64,6 +64,8 @@ pub struct MpvApi {
     terminate_destroy: unsafe extern "C" fn(Handle),
     free: unsafe extern "C" fn(*mut c_void),
     error_string: unsafe extern "C" fn(c_int) -> *const c_char,
+    #[cfg(target_os = "macos")]
+    render: super::render_macos::RenderFns,
 }
 
 // client API 文档保证 handle 级函数多线程安全（wait_event 已单线程化）
@@ -129,6 +131,44 @@ impl MpvApi {
                     "mpv_error_string",
                     unsafe extern "C" fn(c_int) -> *const c_char
                 ),
+                #[cfg(target_os = "macos")]
+                render: super::render_macos::RenderFns {
+                    create: sym!(
+                        "mpv_render_context_create",
+                        unsafe extern "C" fn(
+                            *mut super::render_macos::RenderContext,
+                            Handle,
+                            *mut std::ffi::c_void,
+                        ) -> c_int
+                    ),
+                    set_update_callback: sym!(
+                        "mpv_render_context_set_update_callback",
+                        unsafe extern "C" fn(
+                            super::render_macos::RenderContext,
+                            super::render_macos::UpdateCallback,
+                            *mut c_void,
+                        )
+                    ),
+                    update: sym!(
+                        "mpv_render_context_update",
+                        unsafe extern "C" fn(super::render_macos::RenderContext) -> u64
+                    ),
+                    render: sym!(
+                        "mpv_render_context_render",
+                        unsafe extern "C" fn(
+                            super::render_macos::RenderContext,
+                            *mut c_void,
+                        ) -> c_int
+                    ),
+                    report_swap: sym!(
+                        "mpv_render_context_report_swap",
+                        unsafe extern "C" fn(super::render_macos::RenderContext)
+                    ),
+                    free: sym!(
+                        "mpv_render_context_free",
+                        unsafe extern "C" fn(super::render_macos::RenderContext)
+                    ),
+                },
                 _lib: lib,
             };
             let ver = (api.client_api_version)();
@@ -200,6 +240,8 @@ pub struct MpvEmbed {
     /// 创建或 wid 设置失败时降级为 mpv 自建窗口
     #[cfg(windows)]
     vidwin: Mutex<Option<super::vidwin::VideoWindow>>,
+    #[cfg(target_os = "macos")]
+    renderer: Mutex<Option<super::render_macos::MacRenderer>>,
 }
 
 /// 视频子窗口布局（Phase C 单窗口，Windows）：父窗口 HWND + 客户区矩形（物理像素）。
@@ -219,7 +261,9 @@ impl MpvEmbed {
     fn set_base_options(api: &MpvApi, handle: Handle) -> Result<(), String> {
         for (k, v) in [
             ("idle", "yes"),
-            ("force-window", "yes"),
+            // RenderContext 必须在第一次 VO 创建前就绪；macOS 不让 force-window
+            // 在 mpv_initialize 后抢先回退到 Cocoa 独立窗口。
+            ("force-window", if cfg!(target_os = "macos") { "no" } else { "yes" }),
             ("osc", "no"),
             ("input-default-bindings", "no"),
             ("keep-open", "yes"),
@@ -235,6 +279,13 @@ impl MpvEmbed {
             }
             api.check(code)
                 .map_err(|e| format!("设置 {k}={v} 失败: {e}"))?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let key = CString::new("hwdec").unwrap();
+            let value = CString::new("auto-safe").unwrap();
+            api.check(unsafe { (api.set_option_string)(handle, key.as_ptr(), value.as_ptr()) })
+                .map_err(|e| format!("启用 VideoToolbox 硬件解码失败: {e}"))?;
         }
         Ok(())
     }
@@ -365,12 +416,21 @@ impl MpvEmbed {
             try_create(layout)
         };
         #[cfg(not(windows))]
-        let _ = (layout, app);
+        let _ = layout;
 
         if let Err(e) = api.check(unsafe { (api.initialize)(handle) }) {
             unsafe { (api.terminate_destroy)(handle) };
             return Err(format!("mpv_initialize 失败: {e}"));
         }
+
+        #[cfg(target_os = "macos")]
+        let renderer = match super::render_macos::MacRenderer::create(api.render, handle, app) {
+            Ok(renderer) => renderer,
+            Err(e) => {
+                unsafe { (api.terminate_destroy)(handle) };
+                return Err(e);
+            }
+        };
 
         let dead = Arc::new(AtomicBool::new(false));
         let closing = Arc::new(AtomicBool::new(false));
@@ -383,6 +443,8 @@ impl MpvEmbed {
             event_thread: Mutex::new(Some(event_thread)),
             #[cfg(windows)]
             vidwin: Mutex::new(vidwin),
+            #[cfg(target_os = "macos")]
+            renderer: Mutex::new(Some(renderer)),
         })
     }
 
@@ -395,9 +457,8 @@ impl MpvEmbed {
         self.dead.load(Ordering::SeqCst)
     }
 
-    /// 把前端快捷键同步成 mpv 输入段。macOS 的视频是独立原生窗口；焦点在
-    /// 该窗口时 WebView 收不到 keydown，因此由 mpv 捕获后通过 client-message
-    /// 转发为 `mpv-hotkey` Tauri 事件。Windows 内嵌窗不收输入，但绑定无害。
+    /// 把前端快捷键同步成 mpv 输入段。内嵌视频层不收输入，但绑定无害；
+    /// Linux 独立窗口和手动 IPC 模式用 client-message 转发为前端动作。
     pub fn bind_hotkeys(&self, hotkeys: &HashMap<String, String>) -> Result<(), String> {
         let config = hotkey_section(hotkeys);
         self.command(vec![
@@ -512,11 +573,22 @@ impl MpvEmbed {
         self.vidwin.lock().unwrap().as_ref().map(|v| f(v))
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn set_render_layout(&self, drawer_w: f64, top_h: f64, bottom_h: f64) {
+        if let Some(renderer) = self.renderer.lock().unwrap().as_ref() {
+            renderer.set_layout(drawer_w, top_h, bottom_h);
+        }
+    }
+
     /// 销毁实例；幂等：core 已自行退出（用户关窗口）时仅清理句柄。
     /// 先置 closing 让事件线程在超时轮询内自行退出（join ≤200ms 有保证），
     /// 再 terminate_destroy 收尾；不依赖 wait_event 的 unblock 承诺。
     pub fn shutdown(&self) {
         eprintln!("[embed] shutdown: closing + terminate_destroy");
+        #[cfg(target_os = "macos")]
+        if let Some(mut renderer) = self.renderer.lock().unwrap().take() {
+            renderer.shutdown();
+        }
         self.closing.store(true, Ordering::SeqCst);
         if let Some(t) = self.event_thread.lock().unwrap().take() {
             let _ = t.join();
@@ -653,8 +725,27 @@ pub fn hotkey_section(hotkeys: &HashMap<String, String>) -> String {
     rows.into_iter()
         .filter(|(action, _)| action.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
         .filter_map(|(action, combo)| {
-            combo_to_mpv(combo).map(|key| format!("{key} script-message loopsub-hotkey {action}"))
+            combo_to_mpv(combo).map(|key| {
+                let mut keys = vec![key.clone()];
+                // Cocoa VO 按当前键盘布局上报 charactersIgnoringModifiers。macOS
+                // 拼音布局会把裸方括号上报为全角【/】，而 Shift 后的 {/} 正常，
+                // 所以 AB 设置失效但取消正常。为无 Shift 方括号同时绑定全角别名。
+                let has_shift = combo
+                    .split('+')
+                    .any(|part| part.eq_ignore_ascii_case("shift"));
+                if !has_shift {
+                    match combo.split('+').next_back() {
+                        Some("[") => keys.push(format!("{}【", &key[..key.len() - 1])),
+                        Some("]") => keys.push(format!("{}】", &key[..key.len() - 1])),
+                        _ => {}
+                    }
+                }
+                keys.into_iter()
+                    .map(|key| format!("{key} script-message loopsub-hotkey {action}"))
+                    .collect::<Vec<_>>()
+            })
         })
+        .flatten()
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -705,5 +796,20 @@ mod tests {
             hotkey_section(&hotkeys),
             "SPACE script-message loopsub-hotkey toggle_pause"
         );
+    }
+
+    #[test]
+    fn hotkey_section_adds_macos_pinyin_bracket_aliases() {
+        let hotkeys = HashMap::from([
+            ("ab_set_a".into(), "[".into()),
+            ("ab_nudge_b_back".into(), "ctrl+]".into()),
+            ("ab_clear_a".into(), "shift+[".into()),
+        ]);
+        let section = hotkey_section(&hotkeys);
+        assert!(section.contains("[ script-message loopsub-hotkey ab_set_a"));
+        assert!(section.contains("【 script-message loopsub-hotkey ab_set_a"));
+        assert!(section.contains("Ctrl+】 script-message loopsub-hotkey ab_nudge_b_back"));
+        assert!(section.contains("{ script-message loopsub-hotkey ab_clear_a"));
+        assert!(!section.contains("Shift+【"));
     }
 }
