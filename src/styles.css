@@ -154,13 +154,24 @@ body.video-loading.single #progress-fill {
   padding: 3px 10px;
   cursor: pointer;
   border-left: 3px solid transparent;
+  /* WKWebView 跨 flex 行拖选时会忽略子节点单独设置的 user-select:none；
+     先禁用整行，再只对白色英文区域开放选择，行为才与 WebView2 一致。 */
+  -webkit-user-select: none;
+  user-select: none;
 }
 .line:hover { background: var(--bg-alt); }
-/* 序号/时间戳不可选中：拖选多行复制时只拿到句子文本（同 .zh 译文处理） */
-.line .no { color: var(--fg-dim); min-width: 30px; text-align: right; user-select: none; }
-.line .time { color: var(--fg-dim); min-width: 42px; font-variant-numeric: tabular-nums; user-select: none; cursor: pointer; }
+.line .no { color: var(--fg-dim); min-width: 30px; text-align: right; }
+.line .time { color: var(--fg-dim); min-width: 42px; font-variant-numeric: tabular-nums; cursor: pointer; }
+/* WebKit 会把跨行选区中 user-select:none 的真实文本照样纳入选区；序号、
+   时间和译文改为 generated content，DOM 选区因此只经过英文 text node。 */
+.line .no::before, .line .time::before, .zh::before { content: attr(data-display); }
 .line .time:hover { color: var(--fg); }
-.line .text { flex: 1; }
+.line .text {
+  flex: 1;
+  cursor: text;
+  -webkit-user-select: text;
+  user-select: text;
+}
 .line.current {
   background: var(--current);
   border-left-color: var(--accent);
@@ -172,6 +183,7 @@ body.video-loading.single #progress-fill {
 .zh {
   display: block;
   color: var(--fg-dim);
+  -webkit-user-select: none;
   user-select: none;
 }
 body.no-zh .zh { display: none; }

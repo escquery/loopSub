@@ -39,6 +39,7 @@ document.addEventListener('contextmenu', (e) => {
 const $ = (sel) => document.querySelector(sel);
 const listEl = $('#sentence-list');
 const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const escAttr = (s) => esc(String(s)).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 // ---------- mpv 命令封装 ----------
 async function mpv(...args) {
@@ -377,10 +378,11 @@ function renderList() {
   listEl.innerHTML = state.lines
     .map((l, i) => {
       const zh = state.translations[l.number];
+      const time = fmtTime(l.start_ms);
       return `<div class="line" data-idx="${i}">
-        <span class="no">${l.number}</span>
-        <span class="time" title="点击跳转到这句">${fmtTime(l.start_ms)}</span>
-        <span class="text" title="点击显示/隐藏这句翻译">${esc(l.text)}${zh ? `<span class="zh${state.zhReveal.has(l.number) ? ' reveal' : ''}">${esc(zh)}</span>` : ''}</span>
+        <span class="no" data-display="${escAttr(l.number)}" aria-label="序号 ${escAttr(l.number)}"></span>
+        <span class="time" data-display="${time}" aria-label="时间 ${time}" title="点击跳转到这句"></span>
+        <span class="text" title="点击显示/隐藏这句翻译">${esc(l.text)}${zh ? `<span class="zh${state.zhReveal.has(l.number) ? ' reveal' : ''}" data-display="${escAttr(zh)}" aria-label="译文：${escAttr(zh)}"></span>` : ''}</span>
       </div>`;
     })
     .join('');
@@ -828,6 +830,53 @@ function hasNativeTextSelection() {
     : range.commonAncestorContainer.parentElement;
   return !!container?.closest?.('#sentence-list');
 }
+
+// WebKit 在跨多个 flex 行的原生选区中仍可能把 user-select:none 的序号和
+// 时间戳序列化进剪贴板。按 Range 与每行英文 text node 的交集重建纯英文，
+// 同时保留首尾行的局部字符选区和行间换行。
+function nativeSelectedEnglishText() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return '';
+  const range = sel.getRangeAt(0);
+  const walker = document.createTreeWalker(listEl, NodeFilter.SHOW_TEXT);
+  const rows = [];
+  let node;
+  while ((node = walker.nextNode())) {
+    const textEl = node.parentElement?.closest('.text');
+    if (!textEl || node.parentElement?.closest('.zh')) continue;
+
+    const nodeRange = document.createRange();
+    nodeRange.selectNodeContents(node);
+    if (range.compareBoundaryPoints(Range.START_TO_START, nodeRange) > 0) {
+      nodeRange.setStart(range.startContainer, range.startOffset);
+    }
+    if (range.compareBoundaryPoints(Range.END_TO_END, nodeRange) < 0) {
+      nodeRange.setEnd(range.endContainer, range.endOffset);
+    }
+    if (!nodeRange.toString()) continue;
+    // Range.toString() 在旧 WKWebView 中会把窄面板的视觉软换行也输出为 \n；
+    // 从原始 text node 按选区端点切片，保证每条字幕仍是一行。
+    const start = range.startContainer === node ? range.startOffset : 0;
+    const end = range.endContainer === node ? range.endOffset : node.nodeValue.length;
+    const part = node.nodeValue.slice(start, end);
+    if (!part) continue;
+
+    const row = textEl.closest('.line');
+    const previous = rows[rows.length - 1];
+    if (previous?.row === row) previous.text += part;
+    else rows.push({ row, text: part });
+  }
+  return rows.map((item) => item.text).join('\n');
+}
+
+// 覆盖快捷键、菜单和右键菜单触发的浏览器复制；数据选区复制仍走下方模板。
+document.addEventListener('copy', (e) => {
+  if (!hasNativeTextSelection()) return;
+  const text = nativeSelectedEnglishText();
+  e.preventDefault();
+  if (e.clipboardData) e.clipboardData.setData('text/plain', text);
+  else navigator.clipboard?.writeText(text);
+});
 
 function copySelected() {
   if (state.selected.size === 0) return;
