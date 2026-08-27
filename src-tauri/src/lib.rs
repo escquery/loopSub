@@ -828,7 +828,7 @@ async fn download_subtitle(
 
 // ---------- LLM 翻译 ----------
 
-/// 整集翻译：缓存命中直接返回；否则跑完整管线，进度经 translate-progress 事件推送
+/// 整集翻译：完整缓存命中直接返回；失败/缺失行则续翻，进度经 translate-progress 推送
 #[tauri::command]
 async fn translate_subtitles(
     app: tauri::AppHandle,
@@ -836,16 +836,21 @@ async fn translate_subtitles(
     video_hash: String,
     force: bool,
 ) -> Result<usize, String> {
-    let client = state.llm_client()?;
     let hash = u64::from_str_radix(&video_hash, 16).map_err(|e| e.to_string())?;
     let cache = state.cache();
     let model = state.model_slug();
     let out_path = cache.translated_path(hash, &model);
-
-    if out_path.exists() && !force {
-        let content = std::fs::read_to_string(&out_path).map_err(|e| e.to_string())?;
-        return Ok(subtitle::parse_srt(&content).map_err(|e| e.to_string())?.len());
-    }
+    let cached_translations: std::collections::BTreeMap<u32, String> =
+        if out_path.exists() && !force {
+            let content = std::fs::read_to_string(&out_path).map_err(|e| e.to_string())?;
+            subtitle::parse_srt(&content)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|line| (line.number, line.text))
+                .collect()
+        } else {
+            Default::default()
+        };
 
     // 原文（与展示层一致，应用 truecase）
     let original = cache.original_path(hash);
@@ -858,6 +863,19 @@ async fn translate_subtitles(
         }
     }
 
+    // 只有每一行都有非占位译文才算真正完成。旧实现只检查文件是否存在，
+    // 导致含“翻译失败，可重试”的结果永远直接命中缓存。
+    if !force
+        && lines.iter().all(|line| {
+            cached_translations
+                .get(&line.number)
+                .is_some_and(|zh| !translate::is_failed_translation(zh))
+        })
+    {
+        return Ok(lines.len());
+    }
+
+    let client = state.llm_client()?;
     let (scene_ms, min_b, max_b, conc) = state.llm_tuning();
     let fingerprint = translate::lines_fingerprint(&lines);
     let mut prog = cache.load_progress(hash, &model);
@@ -873,7 +891,19 @@ async fn translate_subtitles(
     let prog = std::sync::Arc::new(std::sync::Mutex::new(prog));
     // 先取出续翻数据：锁守卫若留在 translate_all 实参表达式里，生命周期会延伸到
     // .await 语句尾，导致 MutexGuard 跨 await（std MutexGuard 非 Send）
-    let resume = std::mem::take(&mut prog.lock().unwrap().batches);
+    let mut resume = std::mem::take(&mut prog.lock().unwrap().batches);
+    if !force {
+        // 已成功的旧译文按原批号当作断点回填；失败占位符和缺失行留给 LLM。
+        // 若上次重试中途退出，进度文件中的更新译文优先于旧输出 SRT。
+        translate::merge_cached_translations_into_resume(
+            &lines,
+            &cached_translations,
+            scene_ms,
+            min_b,
+            max_b,
+            &mut resume,
+        );
+    }
     let prog2 = prog.clone();
     let app2 = app.clone();
     let cache2 = cache.clone();
@@ -887,7 +917,8 @@ async fn translate_subtitles(
             max_batch: max_b,
             concurrency: conc,
             resume,
-            line_cache: Some(&mut line_cache),
+            // force=true 表示真正整集重翻，不能再命中旧行缓存。
+            line_cache: if force { None } else { Some(&mut line_cache) },
         },
         move |ev| match ev {
             translate::TranslateEvent::Progress(p) => {
@@ -917,7 +948,8 @@ async fn translate_subtitles(
         }
     }
     std::fs::write(&out_path, &srt).map_err(|e| e.to_string())?;
-    cache.delete_progress(hash, &model); // 整集完成，断点文件退役
+    // 本轮请求已结束，断点文件退役；若仍有失败，下次从输出 SRT 的成功行续翻。
+    cache.delete_progress(hash, &model);
     Ok(outcome.translations.len())
 }
 

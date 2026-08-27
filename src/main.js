@@ -123,6 +123,7 @@ async function loadVideo(path) {
     state.translations = {};
     state.currentIdx = -1;
     state.selected.clear();
+    resetTranslationUi();
     markConnected();
     // libmpv 属性跨 loadfile 保留；先清掉上一视频的对齐值，再恢复当前视频记录。
     state.subDelay = 0;
@@ -249,6 +250,7 @@ $('#btn-load').addEventListener('click', async () => {
     state.translations = {};
     state.currentIdx = -1;
     state.selected.clear();
+    resetTranslationUi();
     renderList();
     $('#trans-bar').classList.remove('hidden');
   } catch (e) {
@@ -305,6 +307,7 @@ $('#search-results').addEventListener('click', async (e) => {
     state.translations = {};
     state.currentIdx = -1;
     state.selected.clear();
+    resetTranslationUi();
     renderList();
     $('#search-panel').classList.add('hidden');
     $('#trans-bar').classList.remove('hidden');
@@ -318,10 +321,40 @@ $('#search-results').addEventListener('click', async (e) => {
 });
 
 // ---------- LLM 翻译 ----------
+const FAILED_TRANSLATION = '[翻译失败，可重试]';
+const isFailedTranslation = (text) => String(text ?? '').trim() === FAILED_TRANSLATION;
+const translationFailureCount = (map = state.translations) =>
+  Object.values(map ?? {}).filter(isFailedTranslation).length;
+
+function setTranslationStatus(text, kind = '', title = text) {
+  const el = $('#trans-progress');
+  el.textContent = text;
+  el.className = kind ? `status-${kind}` : '';
+  el.title = title;
+}
+
+function updateTranslateButtonLabel() {
+  const failed = translationFailureCount();
+  const btn = $('#btn-translate');
+  btn.textContent = failed > 0 ? `重试 ${failed} 句` : '翻译整集';
+  btn.classList.toggle('retry', failed > 0);
+  btn.title = failed > 0 ? `仅重新翻译 ${failed} 个失败或缺失的句子` : '翻译整集字幕';
+  return failed;
+}
+
+function resetTranslationUi() {
+  updateTranslateButtonLabel();
+  setTranslationStatus('');
+  $('#btn-toggle-zh').classList.add('hidden');
+}
+
 listen('translate-progress', (e) => {
   const p = e.payload;
-  $('#trans-progress').textContent =
-    `${p.done_batches}/${p.total_batches} 批` + (p.failed_lines > 0 ? `（${p.failed_lines} 句失败）` : '');
+  const failed = Number(p.failed_lines) || 0;
+  setTranslationStatus(
+    `批次 ${p.done_batches}/${p.total_batches}${failed > 0 ? ` · 失败 ${failed}` : ''}`,
+    failed > 0 ? 'warning' : 'working',
+  );
 });
 
 $('#btn-translate').addEventListener('click', async () => {
@@ -329,32 +362,56 @@ $('#btn-translate').addEventListener('click', async () => {
   const btn = $('#btn-translate');
   btn.disabled = true;
   btn.textContent = '翻译中…';
-  $('#trans-progress').textContent = '准备中…';
+  setTranslationStatus('正在准备…', 'working');
   try {
     const n = await invoke('translate_subtitles', { videoHash: state.videoHash, force: false });
-    $('#trans-progress').textContent = `完成（${n} 句）`;
-    await loadCachedTranslation();
-    osd(`翻译完成（${n} 句）`);
+    const map = await loadCachedTranslation();
+    const failed = translationFailureCount(map);
+    if (failed > 0) {
+      const detail = `已译 ${n - failed}/${n} 句，${failed} 句失败；可再次重试`;
+      setTranslationStatus(`已译 ${n - failed}/${n}`, 'warning', detail);
+      osd(detail);
+    } else {
+      setTranslationStatus(`已译 ${n} 句`, 'success');
+      osd(`翻译完成（${n} 句）`);
+    }
   } catch (e) {
-    $('#trans-progress').textContent = '失败: ' + e;
+    const detail = '翻译失败: ' + e;
+    setTranslationStatus('翻译失败', 'error', detail);
+    osd(detail);
   } finally {
     btn.disabled = false;
-    btn.textContent = '翻译整集';
+    updateTranslateButtonLabel();
   }
 });
 
 async function loadCachedTranslation() {
-  if (!state.videoHash) return;
+  if (!state.videoHash) return {};
   try {
     const map = await invoke('get_translation', { videoHash: state.videoHash });
     if (map && Object.keys(map).length > 0) {
       state.translations = map;
       renderList();
       $('#btn-toggle-zh').classList.remove('hidden');
+      const failed = updateTranslateButtonLabel();
+      const total = Object.keys(map).length;
+      if (!$('#btn-translate').disabled) {
+        if (failed > 0) {
+          setTranslationStatus(
+            `已译 ${total - failed}/${total}`,
+            'warning',
+            `${failed} 句翻译失败，点击“重试 ${failed} 句”继续`,
+          );
+        } else {
+          setTranslationStatus(`已译 ${total} 句`, 'success');
+        }
+      }
+      return map;
     }
   } catch (e) {
     console.warn('load translation failed', e);
   }
+  return {};
 }
 
 function toggleZh() {
@@ -378,11 +435,18 @@ function renderList() {
   listEl.innerHTML = state.lines
     .map((l, i) => {
       const zh = state.translations[l.number];
+      const zhFailed = isFailedTranslation(zh);
+      const zhDisplay = zhFailed ? '⚠ 译文待重试' : zh;
+      const zhMarkup = zh ? `<span
+        class="zh${state.zhReveal.has(l.number) ? ' reveal' : ''}${zhFailed ? ' failed' : ''}"
+        data-display="${escAttr(zhDisplay)}"
+        aria-label="${zhFailed ? '译文生成失败，等待重试' : `译文：${escAttr(zh)}`}"
+        ${zhFailed ? 'title="点击上方重试按钮，仅重试失败句"' : ''}></span>` : '';
       const time = fmtTime(l.start_ms);
       return `<div class="line" data-idx="${i}">
         <span class="no" data-display="${escAttr(l.number)}" aria-label="序号 ${escAttr(l.number)}"></span>
         <span class="time" data-display="${time}" aria-label="时间 ${time}" title="点击跳转到这句"></span>
-        <span class="text" title="点击显示/隐藏这句翻译">${esc(l.text)}${zh ? `<span class="zh${state.zhReveal.has(l.number) ? ' reveal' : ''}" data-display="${escAttr(zh)}" aria-label="译文：${escAttr(zh)}"></span>` : ''}</span>
+        <span class="text" title="点击显示/隐藏这句翻译">${esc(l.text)}${zhMarkup}</span>
       </div>`;
     })
     .join('');

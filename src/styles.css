@@ -186,6 +186,16 @@ body.video-loading.single #progress-fill {
   -webkit-user-select: none;
   user-select: none;
 }
+.zh.failed { margin-top: 2px; color: #e5ad61; }
+.zh.failed::before {
+  display: inline-block;
+  padding: 0 7px;
+  border: 1px solid #76562d;
+  border-radius: 9px;
+  background: #33291d;
+  font-size: 11px;
+  line-height: 17px;
+}
 body.no-zh .zh { display: none; }
 /* 单句翻开例外：双击某句后该句译文即使全局关闭也显示 */
 body.no-zh .zh.reveal { display: block; }
@@ -266,11 +276,37 @@ body.no-zh .zh.reveal { display: block; }
 
 #trans-bar {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
-  padding: 4px 8px;
+  min-height: 42px;
+  padding: 6px 10px;
+  background: #1d1f23;
+  border-bottom: 1px solid #303238;
 }
-#trans-progress { font-size: 12px; }
+#trans-bar button { flex: 0 0 auto; white-space: nowrap; }
+#btn-translate.retry {
+  color: #ffd18a;
+  background: #33291d;
+  border-color: #8b6331;
+}
+#btn-translate.retry:hover { border-color: #d49a4d; }
+#trans-progress {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  padding: 2px 7px;
+  border-radius: 9px;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#trans-progress:empty { display: none; }
+#trans-progress.status-working { color: #afd2ff; background: #22334a; }
+#trans-progress.status-success { color: #a7dfb1; background: #203827; }
+#trans-progress.status-warning { color: #ffd18a; background: #3b2d1c; }
+#trans-progress.status-error { color: #ffb0b0; background: #452525; }
 
 #advanced {
   padding: 0 8px;

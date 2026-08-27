@@ -11,6 +11,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::subtitle::SubtitleLine;
 
+pub const FAILED_TRANSLATION: &str = "[翻译失败，可重试]";
+
+pub fn is_failed_translation(text: &str) -> bool {
+    text.trim() == FAILED_TRANSLATION
+}
+
 #[derive(Debug, Clone)]
 pub struct Batch {
     pub scene: u32,
@@ -181,6 +187,33 @@ pub enum TranslateEvent {
     BatchDone(u32, BTreeMap<u32, String>),
 }
 
+/// 将已生成 SRT 中的成功译文并入批断点。占位符不并入，因此再次执行整集
+/// 翻译时只会请求失败/缺失行；已有中断进度优先于旧 SRT。
+pub fn merge_cached_translations_into_resume(
+    lines: &[SubtitleLine],
+    cached: &BTreeMap<u32, String>,
+    scene_threshold_ms: i64,
+    min_batch: usize,
+    max_batch: usize,
+    resume: &mut BTreeMap<u32, BTreeMap<u32, String>>,
+) {
+    for (idx, batch) in build_batches(lines, scene_threshold_ms, min_batch, max_batch)
+        .into_iter()
+        .enumerate()
+    {
+        let finished = resume.entry(idx as u32).or_default();
+        for line in batch.lines {
+            if let Some(zh) = cached
+                .get(&line.number)
+                .filter(|zh| !is_failed_translation(zh))
+            {
+                finished.entry(line.number).or_insert_with(|| zh.clone());
+            }
+        }
+    }
+    resume.retain(|_, rows| !rows.is_empty());
+}
+
 pub struct TranslateOpts<'a, C: llm::Chat + Clone + 'static> {
     pub client: &'a C,
     pub lines: &'a [SubtitleLine],
@@ -337,7 +370,7 @@ pub async fn translate_all<C: llm::Chat + Clone + 'static>(
                     }
                 }
                 None => {
-                    out.translations.insert(n, "[翻译失败，可重试]".to_string());
+                    out.translations.insert(n, FAILED_TRANSLATION.to_string());
                     out.failed.push(n);
                 }
             }
@@ -604,6 +637,24 @@ mod tests {
         let progress = progress.borrow();
         assert_eq!(progress.first().unwrap().total_batches, 2);
         assert_eq!(progress.last().unwrap().done_batches, 2);
+    }
+
+    #[test]
+    fn cached_resume_excludes_failure_placeholders_and_keeps_newer_progress() {
+        let lines = dialogue(4, 0);
+        let cached = BTreeMap::from([
+            (1, "旧译文".to_string()),
+            (2, FAILED_TRANSLATION.to_string()),
+            (3, "第三句".to_string()),
+        ]);
+        let mut resume = BTreeMap::from([(0, BTreeMap::from([(1, "新译文".to_string())]))]);
+        merge_cached_translations_into_resume(&lines, &cached, 60_000, 1, 2, &mut resume);
+
+        let merged: BTreeMap<_, _> = resume.into_values().flatten().collect();
+        assert_eq!(merged.get(&1).unwrap(), "新译文");
+        assert!(!merged.contains_key(&2), "失败占位符必须进入重试");
+        assert_eq!(merged.get(&3).unwrap(), "第三句");
+        assert!(!merged.contains_key(&4), "缺失行必须进入重试");
     }
 
     #[tokio::test]
