@@ -14,6 +14,7 @@ Original>
 Translation>
 <translated text>
 - Translate EVERY line. Keep numbers unchanged. Never merge or split lines.
+- 每条 Translation> 下只输出译文，允许连续多行，但段内不得出现空行。不要添加注意事项、翻译解释、前言或 Markdown 代码围栏；术语只放在末尾的 <terminology> 块中。
 - Use natural, colloquial Chinese for TV dialogue; concise and faithful; adapt idioms instead of literal translation.
 - After all translated lines, output exactly one summary line:
 <summary>one English sentence summarizing this batch, as context for later batches</summary>

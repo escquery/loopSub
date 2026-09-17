@@ -81,6 +81,18 @@ pub fn parse_srt(content: &str) -> Result<Vec<SubtitleLine>, SubtitleError> {
     Ok(lines)
 }
 
+/// 仅用于生成的译文缓存：跳过旧模型输出混入的说明段和损坏块，保留可续翻的有效行。
+/// 原文字幕仍使用严格的 parse_srt，避免静默丢失源台词。
+pub fn parse_translated_srt(content: &str) -> Vec<SubtitleLine> {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    normalized
+        .split("\n\n")
+        .filter_map(|block| parse_srt(block).ok())
+        .flatten()
+        .filter(|line| !line.text.trim().is_empty())
+        .collect()
+}
+
 pub fn to_srt(lines: &[SubtitleLine]) -> String {
     lines
         .iter()
@@ -165,6 +177,34 @@ mod tests {
         assert_eq!(lines[0].end_ms, 4000);
         assert_eq!(lines[1].start_ms, 5250);
         assert_eq!(lines[1].text, "I'M FINE. THANK YOU.");
+    }
+
+    #[test]
+    fn translated_cache_recovers_valid_cues_around_notes() {
+        let content = "7\n00:00:01,500 --> 00:00:04,000\n你太不负责任了。\n\n注意:irresponsible 译作“不负责任”.\n\n42\n00:00:05,250 --> 00:00:07,000\n- 对不起。\n- 没关系。\n\n额外说明";
+        assert!(parse_srt(content).is_err(), "原文解析仍须严格校验");
+        for content in [content.to_string(), content.replace('\n', "\r\n")] {
+            let lines = parse_translated_srt(&content);
+            assert_eq!(lines.len(), 2);
+            assert_eq!(lines[0].number, 7);
+            assert_eq!(lines[0].start_ms, 1500);
+            assert_eq!(lines[0].end_ms, 4000);
+            assert_eq!(lines[0].text, "你太不负责任了。");
+            assert_eq!(lines[1].number, 42);
+            assert_eq!(lines[1].text, "- 对不起。\n- 没关系。");
+        }
+    }
+
+    #[test]
+    fn translated_cache_skips_broken_and_empty_cues_for_retry() {
+        let content = format!(
+            "说明段\n\n{SAMPLE}\n\n3\nbad timing\n无效译文\n\n4\n00:00:08,000 --> 00:00:09,000\n\n"
+        );
+        let lines = parse_translated_srt(&content);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].number, 1);
+        assert_eq!(lines[1].number, 2);
+        assert!(parse_translated_srt("只有说明，没有字幕").is_empty());
     }
 
     #[test]

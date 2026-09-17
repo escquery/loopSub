@@ -843,10 +843,10 @@ async fn translate_subtitles(
     let cached_translations: std::collections::BTreeMap<u32, String> =
         if out_path.exists() && !force {
             let content = std::fs::read_to_string(&out_path).map_err(|e| e.to_string())?;
-            subtitle::parse_srt(&content)
-                .map_err(|e| e.to_string())?
+            subtitle::parse_translated_srt(&content)
                 .into_iter()
-                .map(|line| (line.number, line.text))
+                .map(|line| (line.number, translate::parser::clean_translation(&line.text)))
+                .filter(|(_, zh)| !zh.is_empty())
                 .collect()
         } else {
             Default::default()
@@ -938,6 +938,13 @@ async fn translate_subtitles(
     let mut srt = String::new();
     for line in &lines {
         if let Some(zh) = outcome.translations.get(&line.number) {
+            // 行缓存和断点可能来自旧版本，写 SRT 前也要隔离空行与尾注。
+            let zh = translate::parser::clean_translation(zh);
+            let zh = if zh.is_empty() {
+                translate::FAILED_TRANSLATION
+            } else {
+                &zh
+            };
             srt.push_str(&format!(
                 "{}\n{} --> {}\n{}\n\n",
                 line.number,
@@ -974,9 +981,10 @@ fn get_translation(
     let path = state.cache().translated_path(hash, &state.model_slug());
     let mut map = std::collections::BTreeMap::new();
     if let Ok(content) = std::fs::read_to_string(&path) {
-        if let Ok(lines) = subtitle::parse_srt(&content) {
-            for l in lines {
-                map.insert(l.number, l.text);
+        for l in subtitle::parse_translated_srt(&content) {
+            let zh = translate::parser::clean_translation(&l.text);
+            if !zh.is_empty() {
+                map.insert(l.number, zh);
             }
         }
     }

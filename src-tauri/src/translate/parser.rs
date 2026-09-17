@@ -28,9 +28,13 @@ pub fn parse_response(text: &str) -> ParsedBatch {
             }
         }
     }
-    let body = strip_tag(text, "summary");
-    let body = strip_tag(&body, "terminology");
-    out.translations = parse_lines(&body);
+    // 元信息之后不再有字幕，避免尾部说明被拼到最后一句译文中。
+    let body_end = ["<summary>", "<terminology>"]
+        .iter()
+        .filter_map(|tag| text.find(tag))
+        .min()
+        .unwrap_or(text.len());
+    out.translations = parse_lines(&text[..body_end]);
     out
 }
 
@@ -42,17 +46,22 @@ fn extract_tag(text: &str, tag: &str) -> Option<String> {
     Some(text[start..end].to_string())
 }
 
-fn strip_tag(text: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    if let Some(start) = text.find(&open) {
-        let end = text[start..]
-            .find(&close)
-            .map(|i| start + i + close.len())
-            .unwrap_or(text.len());
-        return format!("{}{}", &text[..start], &text[end..]);
-    }
-    text.to_string()
+/// 只保留译文的首个非空段落，保留段内换行；说明、围栏和元信息不得进入 SRT。
+/// 写缓存时也调用，兼容旧行缓存与断点中残留的空行和尾注。
+pub fn clean_translation(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    normalized
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| line.is_empty() || line.starts_with("```"))
+        .take_while(|line| {
+            !line.is_empty()
+                && !line.starts_with("```")
+                && !line.starts_with("<summary>")
+                && !line.starts_with("<terminology>")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 行解析：状态机驱动，容忍空行与大小写差异
@@ -64,9 +73,9 @@ fn parse_lines(body: &str) -> BTreeMap<u32, String> {
 
     fn flush(number: Option<u32>, buf: &mut String, map: &mut BTreeMap<u32, String>) {
         if let Some(n) = number {
-            let t = buf.trim();
+            let t = clean_translation(buf);
             if !t.is_empty() {
-                map.insert(n, t.to_string());
+                map.insert(n, t);
             }
         }
         buf.clear();
@@ -154,6 +163,49 @@ Ghost::幽灵
         assert_eq!(p.translations.get(&2).unwrap(), "我是瑞秋。");
         assert_eq!(p.summary.as_deref(), Some("They greet each other."));
         assert_eq!(p.terminology.get("Rachel").unwrap(), "瑞秋");
+    }
+
+    #[test]
+    fn ignores_separate_translation_notes() {
+        let p = parse_response(
+            "#1\nOriginal>\nYou're irresponsible.\nTranslation>\n你太不负责任了。\n\n注意:irresponsible 译作“不负责任”.\n\n#2\nOriginal>\nSorry.\nTranslation>\n对不起。",
+        );
+        assert_eq!(p.translations[&1], "你太不负责任了。");
+        assert_eq!(p.translations[&2], "对不起。");
+        assert!(validate(&p, &[1, 2]).is_empty());
+    }
+
+    #[test]
+    fn metadata_ends_translation_even_without_blank_lines() {
+        let p = parse_response(
+            "#1\nOriginal>\nHello.\nTranslation>\n你好。\n<summary>A greeting.</summary>\n<terminology>\n</terminology>\n注意：以上为译文。",
+        );
+        assert_eq!(p.translations[&1], "你好。");
+        assert_eq!(p.summary.as_deref(), Some("A greeting."));
+    }
+
+    #[test]
+    fn cleans_fences_and_notes_but_keeps_multiline_dialogue() {
+        let p = parse_response(
+            "```text\r\n#7\r\nOriginal>\r\nWatch out!\r\nTranslation>\r\n\r\n注意：别碰它！\r\n- 好的。\r\n```\r\n尾部说明",
+        );
+        assert_eq!(p.translations[&7], "注意：别碰它！\n- 好的。");
+        assert_eq!(
+            clean_translation("\r\n你好。\r\n \t\r\n注意：额外说明"),
+            "你好。"
+        );
+        assert_eq!(clean_translation("```\n你好。\n```"), "你好。");
+        assert_eq!(clean_translation("你好。\r再见。"), "你好。\n再见。");
+        assert_eq!(clean_translation(" \n\t\n"), "");
+    }
+
+    #[test]
+    fn empty_translation_before_metadata_still_needs_retry() {
+        let p = parse_response(
+            "#1\nOriginal>\nHello.\nTranslation>\n\n<summary>A greeting.</summary>\n注意：没有译文。",
+        );
+        assert!(!p.translations.contains_key(&1));
+        assert_eq!(validate(&p, &[1]).len(), 1);
     }
 
     #[test]
