@@ -30,8 +30,10 @@ loopSub ──spawn──> ffmpeg / ffprobe
 
 - 默认播放控制直接调用进程内 libmpv Client API；JSON IPC 只保留手动连接模式。
 - Windows 由 mpv 渲染到自建 HWND 子窗口。
-- macOS 创建透明 WKWebView + `NSOpenGLView`，libmpv Render API 绘制 Retina framebuffer；更新回调只投递 AppKit 主线程，VideoToolbox 负责硬解。
+- macOS 创建透明 WKWebView + OpenGL 3.2 Core 双缓冲 `NSOpenGLView`；libmpv 更新回调只唤醒专用渲染线程，VideoToolbox 负责硬解。
+- Windows/macOS 都以 `hwdec=auto-safe` 初始化，分别优先使用 D3D11VA / VideoToolbox。
 - 视频层避开 44px 顶栏、14px 进度条与右侧字幕面板，不参与鼠标和键盘输入。
+- 最小化、隐藏或被完全覆盖时停止提交视频帧；macOS 默认用逻辑分辨率 surface，由 WindowServer 缩放到 Retina，设置页可切回高分辨率。
 - 主窗口关闭时整个进程退出，因此不会遗留独立 mpv 窗口或焦点问题。
 
 ### 三种状态三种界面
@@ -45,7 +47,8 @@ loopSub ──spawn──> ffmpeg / ffprobe
 ## 3. mpv 控制（Client API；手动模式兼容 JSON IPC）
 
 - 默认：同进程 `mpv_command` / `mpv_get_property` / `mpv_set_property`。
-- 手动连接外部 mpv 时：mac/Linux Unix socket、Windows 命名管道。
+- 播放状态用 `mpv_observe_property` 订阅并在事件线程合并为最多每 200ms 一次推送，避免 WebView 高频跨桥轮询。
+- 手动连接外部 mpv 时：mac/Linux Unix socket、Windows 命名管道；以前端每 500ms 一次的聚合读取兜底。
 - libmpv handle、RenderContext 和原生视频层生命周期均随主窗口。
 
 ### 功能 → 命令映射
@@ -69,9 +72,10 @@ loopSub ──spawn──> ffmpeg / ffprobe
 
 ## 4. 字幕显示
 
-- 默认由**面板字幕条渲染**（两行：原文+译文，样式自控），mpv 侧 `sub-visibility=no` 关闭自带渲染，避免冲突
-- 字幕轨照常加载（`sid` 保留），保证 `sub-text`/`sub-start`/`sub-end` 可用
-- 逃生开关："由 mpv 渲染字幕"（`--secondary-sid` 双轨：原文底部、译文顶部）——应对 ASS 特效字幕
+- Windows 与 macOS 默认都由 **mpv 在视频画面渲染字幕**，行为与原生 mpv 一致；右侧句子面板同时保留
+- 设置可切换为“仅右侧面板显示”，此时统一设置 `sub-visibility=no`
+- 字幕轨始终加载（`sid` 保留），保证 `sub-text`/`sub-start`/`sub-end`、逐句跳转和延迟调整可用
+- 渲染设置保存后实时更新当前播放器，不需要重新打开视频
 
 ## 5. 字幕获取管线
 
@@ -190,12 +194,12 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 |---|---|---|
 | 快捷键 | 全键位可改 + 冲突检测 + 恢复默认 | 上表 |
 | 音频 | 对白增强 / 音量上限 | 开 / 关闭 |
-| 字幕 | 大写还原：规则法/LLM；渲染：面板/mpv；延迟步长 | 规则法 / 面板 / 0.1s |
+| 字幕 | 大写还原：规则法/LLM；渲染：面板/mpv；延迟步长 | 规则法 / mpv / 0.1s |
 | 复制 | 模板、附带上下文句数 | 内置模板 / 0 |
 | OpenSubtitles | API Key | 空（用时校验） |
 | LLM | Base URL / 模型 / API Key / 并发 / 批次大小 / 超时 | 空（用时校验） |
 | 缓存 | 缓存目录、清理策略 | 系统应用数据目录 |
-| 窗口 | 停靠侧、失焦沉底、切回召回 mpv | 右 / 开 / 开 |
+| 窗口 | 停靠侧、失焦沉底、切回召回 mpv、macOS Retina 省电渲染 | 右 / 开 / 开 / 开 |
 
 ## 12. 缓存目录结构
 

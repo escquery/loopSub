@@ -260,6 +260,13 @@ impl VideoWindow {
         }
     }
 
+    /// 父窗口最小化/页面隐藏时隐藏视频 HWND，让 D3D/DWM 停止提交不可见帧。
+    pub fn set_visible(&self, visible: bool) {
+        unsafe {
+            ShowWindow(self.hwnd(), if visible { SW_SHOWNA } else { SW_HIDE });
+        }
+    }
+
     /// 抬到兄弟窗口 z 序顶端（不抢焦点）
     pub fn raise(&self) {
         unsafe {

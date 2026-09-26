@@ -2,7 +2,10 @@
 //! 设计依据见仓库根目录 DESIGN.md。
 
 pub mod anki;
+mod bins;
 pub mod cache;
+#[cfg(windows)]
+mod explorer_menu;
 pub mod media;
 pub mod mpv;
 pub mod opensub;
@@ -10,9 +13,6 @@ pub mod settings;
 pub mod subtitle;
 pub mod sync;
 pub mod translate;
-mod bins;
-#[cfg(windows)]
-mod explorer_menu;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -61,14 +61,25 @@ fn relayout_video(app: &tauri::AppHandle) {
         return;
     };
     let state = app.state::<AppState>();
-    let Ok(scale) = win.scale_factor() else { return };
+    let visible = !win.is_minimized().unwrap_or(false);
+    let Ok(scale) = win.scale_factor() else {
+        return;
+    };
     let Ok(size) = win.inner_size() else { return };
     let drawer_open = *state.drawer_open.lock().unwrap();
 
     // 本函数在主线程执行：不能阻塞等待 mpv 锁，创建 RenderContext 的工作线程
     // 可能正反向等待 AppKit；拿不到就由下一次 ready/resize 重试。
-    let Ok(guard) = state.mpv.try_lock() else { return };
-    let Some(Mpv::Embed(e)) = guard.as_ref() else { return };
+    let Ok(guard) = state.mpv.try_lock() else {
+        return;
+    };
+    let Some(Mpv::Embed(e)) = guard.as_ref() else {
+        return;
+    };
+    e.set_video_visible(visible);
+    if !visible {
+        return;
+    }
 
     #[cfg(windows)]
     {
@@ -81,7 +92,12 @@ fn relayout_video(app: &tauri::AppHandle) {
         };
         let (w, h) = (size.width as i32, size.height as i32);
         e.with_vidwin(|vw| {
-            vw.set_rect(0, bar_h, (w - drawer_w).max(1), (h - bar_h - progress_h).max(1));
+            vw.set_rect(
+                0,
+                bar_h,
+                (w - drawer_w).max(1),
+                (h - bar_h - progress_h).max(1),
+            );
             vw.raise();
         });
     }
@@ -346,9 +362,13 @@ impl AppState {
     /// LLM 客户端（惰性校验：首次翻译时才检查配置）
     fn llm_client(&self) -> Result<translate::llm::LlmClient, String> {
         let llm = self.settings.lock().unwrap().llm.clone();
-        let base = llm.base_url.filter(|s| !s.is_empty())
+        let base = llm
+            .base_url
+            .filter(|s| !s.is_empty())
             .ok_or("未配置大模型 Base URL，请到设置页填写")?;
-        let model = llm.model.filter(|s| !s.is_empty())
+        let model = llm
+            .model
+            .filter(|s| !s.is_empty())
             .ok_or("未配置模型名，请到设置页填写")?;
         Ok(translate::llm::LlmClient::new(
             &base,
@@ -360,7 +380,8 @@ impl AppState {
     /// OpenSubtitles 客户端（惰性校验：首次搜索时才检查 key）
     fn os_client(&self) -> Result<opensub::OsClient, String> {
         let key = self.settings.lock().unwrap().opensubtitles.api_key.clone();
-        let key = key.filter(|s| !s.is_empty())
+        let key = key
+            .filter(|s| !s.is_empty())
             .ok_or("未配置 OpenSubtitles API Key，请到设置页填写")?;
         Ok(opensub::OsClient::new(&key))
     }
@@ -403,15 +424,32 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
-async fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<(), String> {
-    settings.save(&state.settings_path).map_err(|e| e.to_string())?;
+async fn save_settings(
+    state: tauri::State<'_, AppState>,
+    settings: Settings,
+) -> Result<(), String> {
+    settings
+        .save(&state.settings_path)
+        .map_err(|e| e.to_string())?;
     let hotkeys = settings.hotkeys.clone();
+    let subtitle_visible = matches!(settings.subtitle.render, settings::RenderMode::Mpv);
+    let low_power_video = settings.window.macos_low_power_video;
     *state.settings.lock().unwrap() = settings;
-    // 独立视频窗/手动 IPC 也要实时拿到改绑后的按键；绑定失败不影响
-    // 设置落盘，下一次创建 mpv 实例时还会再同步。
+    // 快捷键和视频画面字幕均实时生效；失败不影响已成功落盘的设置，下一次
+    // 创建 mpv 实例时仍会按设置重新同步。
     if let Some(mpv) = state.mpv.lock().await.as_ref() {
         if let Err(e) = mpv.bind_hotkeys(&hotkeys).await {
             eprintln!("[hotkeys] rebind failed: {e}");
+        }
+        if let Err(e) = mpv
+            .set_property("sub-visibility", subtitle_visible.into())
+            .await
+        {
+            eprintln!("[subtitle] visibility update failed: {e}");
+        }
+        #[cfg(target_os = "macos")]
+        if let Mpv::Embed(embed) = mpv {
+            embed.set_low_power_video(low_power_video);
         }
     }
     Ok(())
@@ -455,7 +493,7 @@ async fn mpv_start_internal(state: &AppState, app: &tauri::AppHandle) -> Result<
             e.shutdown();
         }
     }
-        // 设置目录/exe 目录找不到时，裸名走系统动态库搜索路径兜底
+    // 设置目录/exe 目录找不到时，裸名走系统动态库搜索路径兜底
     // （Linux 发行版仓库、macOS Homebrew 安装的 libmpv）
     let api = match mpv::embed::resolve_dll(state.settings.lock().unwrap().bins.dir.clone()) {
         Some(dll) => mpv::embed::MpvApi::load(&dll)?,
@@ -487,7 +525,8 @@ async fn mpv_start_internal(state: &AppState, app: &tauri::AppHandle) -> Result<
     #[cfg(not(windows))]
     let layout = None;
 
-    let embed = mpv::embed::MpvEmbed::new(api, layout, app)?;
+    let low_power_video = state.settings.lock().unwrap().window.macos_low_power_video;
+    let embed = mpv::embed::MpvEmbed::new(api, layout, app, low_power_video)?;
     let m = Mpv::Embed(embed);
 
     // Linux 独立窗口需要快捷键桥；Windows/macOS 内嵌层不接收输入，但同步
@@ -518,7 +557,11 @@ async fn mpv_start_internal(state: &AppState, app: &tauri::AppHandle) -> Result<
 }
 
 #[tauri::command]
-async fn mpv_start(app: tauri::AppHandle, state: tauri::State<'_, AppState>, video_path: Option<String>) -> Result<String, String> {
+async fn mpv_start(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    video_path: Option<String>,
+) -> Result<String, String> {
     mpv_start_internal(&state, &app).await?;
     if let Some(vp) = video_path {
         let guard = state.mpv.lock().await;
@@ -552,7 +595,9 @@ async fn mpv_quit(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// 连接外部已运行的 mpv（手动模式）
 #[tauri::command]
 async fn mpv_connect(state: tauri::State<'_, AppState>, socket_path: String) -> Result<(), String> {
-    let ipc = MpvIpc::connect(&socket_path).await.map_err(|e| e.to_string())?;
+    let ipc = MpvIpc::connect(&socket_path)
+        .await
+        .map_err(|e| e.to_string())?;
     let mpv = Mpv::Ipc(ipc);
     let hotkeys = state.settings.lock().unwrap().hotkeys.clone();
     if let Err(e) = mpv.bind_hotkeys(&hotkeys).await {
@@ -569,8 +614,31 @@ async fn mpv_command(
     args: Vec<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let guard = state.mpv.lock().await;
-    let ipc = guard.as_ref().ok_or_else(|| "mpv not connected".to_string())?;
+    let ipc = guard
+        .as_ref()
+        .ok_or_else(|| "mpv not connected".to_string())?;
     ipc.command(args).await.map_err(|e| e.to_string())
+}
+
+/// 手动 IPC 模式的低频兜底；进程内 libmpv 正常通过 mpv-playback-state 推送。
+#[tauri::command]
+async fn mpv_playback_snapshot(
+    state: tauri::State<'_, AppState>,
+) -> Result<mpv::PlaybackSnapshot, String> {
+    let guard = state.mpv.lock().await;
+    let mpv = guard
+        .as_ref()
+        .ok_or_else(|| "mpv not connected".to_string())?;
+    Ok(mpv.playback_snapshot().await)
+}
+
+/// WebView 页面隐藏/恢复时节流原生视频输出；不暂停音频或播放时钟。
+#[tauri::command]
+async fn set_video_visible(state: tauri::State<'_, AppState>, visible: bool) -> Result<(), String> {
+    if let Some(Mpv::Embed(embed)) = state.mpv.lock().await.as_ref() {
+        embed.set_video_visible(visible);
+    }
+    Ok(())
 }
 
 // ---------- 视频加载管线 ----------
@@ -579,9 +647,6 @@ async fn mpv_command(
 /// 上一句/下一句依赖 mpv sub-seek；可见性只决定画面是否由 mpv 重复绘制。
 /// loadfile 的 demuxer 异步打开，轮询 duration 至就绪后再 sub-add。
 async fn attach_subtitle_track(state: &AppState, path: &std::path::Path) -> Result<(), String> {
-    #[cfg(windows)]
-    let visible = true;
-    #[cfg(not(windows))]
     let visible = !state.panel_render();
 
     let path = path.to_string_lossy().into_owned();
@@ -598,11 +663,7 @@ async fn attach_subtitle_track(state: &AppState, path: &std::path::Path) -> Resu
                         .await
                         .map_err(|e| e.to_string())?;
                     match mpv
-                        .command(vec![
-                            "sub-add".into(),
-                            path.clone().into(),
-                            "select".into(),
-                        ])
+                        .command(vec!["sub-add".into(), path.clone().into(), "select".into()])
                         .await
                     {
                         Ok(_) => return Ok(()),
@@ -622,7 +683,11 @@ async fn attach_subtitle_track(state: &AppState, path: &std::path::Path) -> Resu
 /// 文本字幕到缓存目录；最后拉起 mpv 播放。无内嵌文本轨时降级为 notice，
 /// 由前端走 OpenSubtitles 搜索流程。
 #[tauri::command]
-async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, path: String) -> Result<media::LoadVideoResult, String> {
+async fn load_video(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<media::LoadVideoResult, String> {
     let video = PathBuf::from(&path);
     if !video.exists() {
         // 历史里的失效记录顺手剔除
@@ -723,11 +788,10 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        // 面板形态（非 Windows）：字幕由面板 mini-bar 渲染，mpv 侧关字幕防双显
-        #[cfg(not(windows))]
-        if state.panel_render() {
-            let _ = ipc.set_property("sub-visibility", false.into()).await;
-        }
+        // Windows/macOS 使用同一规则：mpv 模式在视频画面显示，panel 模式
+        // 仅保留右侧句子列表和活动字幕轨。
+        let visible = !state.panel_render();
+        let _ = ipc.set_property("sub-visibility", visible.into()).await;
     }
 
     // 锁已释放：落位原生视频层（mpv_start_internal 的投递可能撞锁被跳过）
@@ -737,12 +801,16 @@ async fn load_video(app: tauri::AppHandle, state: tauri::State<'_, AppState>, pa
         let _ = app.run_on_main_thread(move || relayout_video(&app2));
     }
 
-    // 所有平台都挂载同一份已解析字幕。macOS/Linux 默认由面板绘制，后端会
-    // 把 sub-visibility 设为 false，但仍保留活动轨供 sub-seek/延迟/速度使用。
+    // 所有平台都挂载同一份已解析字幕，并按统一设置决定是否在视频画面显示；
+    // 即使仅面板显示也保留活动轨，供 sub-seek/延迟/速度使用。
     if source != "none" {
         let sub_path = if state.rule_truecase() {
             let tc = cache.truecased_path(hash);
-            if tc.exists() { tc } else { original.clone() }
+            if tc.exists() {
+                tc
+            } else {
+                original.clone()
+            }
         } else {
             original.clone()
         };
@@ -818,7 +886,11 @@ async fn download_subtitle(
     // 正在播放时立即挂载；面板模式隐藏画面字幕，但保留活动轨供 sub-seek。
     let sub_path = if state.rule_truecase() {
         let tc = cache.truecased_path(hash);
-        if tc.exists() { tc } else { cache.original_path(hash) }
+        if tc.exists() {
+            tc
+        } else {
+            cache.original_path(hash)
+        }
     } else {
         cache.original_path(hash)
     };
@@ -1076,7 +1148,10 @@ async fn extract_pcm(ffmpeg: &std::path::Path, video: &str) -> Result<Vec<i16>, 
         .await
         .map_err(|e| format!("ffmpeg 启动失败: {e}"))?;
     if !out.status.success() {
-        return Err(format!("ffmpeg 提取音频失败: {}", String::from_utf8_lossy(&out.stderr)));
+        return Err(format!(
+            "ffmpeg 提取音频失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     Ok(out
         .stdout
@@ -1130,7 +1205,10 @@ fn save_sync_offset(
 }
 
 #[tauri::command]
-fn get_sync_offset(state: tauri::State<'_, AppState>, video_hash: String) -> Option<cache::SyncOffset> {
+fn get_sync_offset(
+    state: tauri::State<'_, AppState>,
+    video_hash: String,
+) -> Option<cache::SyncOffset> {
     let hash = u64::from_str_radix(&video_hash, 16).ok()?;
     state.cache().load_sync_offset(hash)
 }
@@ -1208,7 +1286,10 @@ async fn export_anki_note(
         });
         let mut shot_ok = false;
         for _ in 0..40 {
-            if std::fs::metadata(&img).map(|m| m.len() > 0).unwrap_or(false) {
+            if std::fs::metadata(&img)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+            {
                 shot_ok = true;
                 break;
             }
@@ -1217,7 +1298,9 @@ async fn export_anki_note(
         if !shot_ok {
             return Err("截图超时（2s）：mpv 未写出文件".into());
         }
-        cut.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        cut.await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
 
         // 3) 组装素材
         let stem2 = stem;
@@ -1245,7 +1328,11 @@ async fn export_anki_note(
         let s = state.settings.lock().unwrap();
         (
             s.anki.deck.clone(),
-            s.anki.tags.split_whitespace().map(|t| t.to_string()).collect::<Vec<_>>(),
+            s.anki
+                .tags
+                .split_whitespace()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>(),
             s.anki.connect_url.clone(),
         )
     };
@@ -1321,8 +1408,8 @@ async fn pick_video(window: tauri::Window) -> Option<String> {
         .add_filter(
             "视频文件",
             &[
-                "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "ts", "m2ts", "mpg",
-                "mpeg", "rmvb",
+                "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "ts", "m2ts", "mpg", "mpeg",
+                "rmvb",
             ],
         )
         .blocking_pick_file();
@@ -1399,7 +1486,44 @@ pub fn run() {
                 });
             }
             #[cfg(target_os = "macos")]
-            constrain_macos_panel(app.handle(), true);
+            {
+                constrain_macos_panel(app.handle(), true);
+                // NSWindow 的 occlusionState 能识别最小化、Cmd+H 和被其他窗口
+                // 完全覆盖。不可见时 Render API 仍消费更新但跳过 OpenGL 提交；
+                // 两次/秒的主线程查询远低于持续渲染视频帧的成本。
+                let app_handle = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let app2 = app_handle.clone();
+                    if app_handle
+                        .run_on_main_thread(move || {
+                            use objc2_app_kit::{NSWindow, NSWindowOcclusionState};
+                            let Some(window) = app2.get_webview_window("main") else {
+                                return;
+                            };
+                            let Ok(window_id) = window.ns_window() else {
+                                return;
+                            };
+                            let visible = unsafe {
+                                let native = &*(window_id as *const NSWindow);
+                                !native.isMiniaturized()
+                                    && native
+                                        .occlusionState()
+                                        .contains(NSWindowOcclusionState::Visible)
+                            };
+                            let state = app2.state::<AppState>();
+                            if let Ok(guard) = state.mpv.try_lock() {
+                                if let Some(Mpv::Embed(embed)) = guard.as_ref() {
+                                    embed.set_video_visible(visible);
+                                }
+                            };
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                });
+            }
 
             // 视频渲染子窗口样式看门狗（Windows）：mpv 会异步创建内部子窗口，
             // 定期补上禁用与命中穿透。这里只处理子窗口样式，绝不调用 set_focus
@@ -1411,37 +1535,63 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 std::thread::spawn(move || {
                     loop {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    let Some(win) = app_handle.get_webview_window("main") else { break };
-                    let Ok(hwnd) = win.hwnd() else { break };
-                    let main = hwnd.0 as HWND;
-                    // mpv 会在 loopsub-video 内自建 mpv 类子窗口做渲染输出：它一旦
-                    // 持焦键盘就全废（属 libmpv VO 线程，主线程 GUIThreadInfo 看不
-                    // 到，消息也不经我们的 wndproc）。找到就补 WS_DISABLED——不收任
-                    // 何鼠标键盘输入，命中测试穿透回我们的穿透链；渲染不走输入路径
-                    // 无副作用。换视频重建窗口后会自动再补（幂等）。
-                    let vc: Vec<u16> = "loopsub-video".encode_utf16().chain(std::iter::once(0)).collect();
-                    let mc: Vec<u16> = "mpv".encode_utf16().chain(std::iter::once(0)).collect();
-                    let video = unsafe { FindWindowExW(main, std::ptr::null_mut(), vc.as_ptr(), std::ptr::null()) };
-                    if !video.is_null() {
-                        let mpvw = unsafe { FindWindowExW(video, std::ptr::null_mut(), mc.as_ptr(), std::ptr::null()) };
-                        if !mpvw.is_null() {
-                            let style = unsafe { GetWindowLongPtrW(mpvw, GWL_STYLE) };
-                            if style & (WS_DISABLED as isize) == 0 {
-                                unsafe { SetWindowLongPtrW(mpvw, GWL_STYLE, style | (WS_DISABLED as isize)) };
-                            }
-                            // WS_DISABLED 只断输入不断命中：disabled 窗口的 NCHITTEST
-                            // 仍返回 HTCLIENT，鼠标 down 派发给它后被系统直接丢弃——
-                            // 穿透链断、主窗口不激活（实测病根：点画面窗口不置前）。
-                            // 补 WS_EX_TRANSPARENT 让命中测试整体跳过它（WebView2 自带
-                            // 的 D3D 输出窗口同为 disabled，就靠此样式让位）；只影响
-                            // 命中测试，不影响 mpv 渲染输出
-                            let exstyle = unsafe { GetWindowLongPtrW(mpvw, GWL_EXSTYLE) };
-                            if exstyle & (WS_EX_TRANSPARENT as isize) == 0 {
-                                unsafe { SetWindowLongPtrW(mpvw, GWL_EXSTYLE, exstyle | (WS_EX_TRANSPARENT as isize)) };
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let Some(win) = app_handle.get_webview_window("main") else {
+                            break;
+                        };
+                        let Ok(hwnd) = win.hwnd() else { break };
+                        let main = hwnd.0 as HWND;
+                        // mpv 会在 loopsub-video 内自建 mpv 类子窗口做渲染输出：它一旦
+                        // 持焦键盘就全废（属 libmpv VO 线程，主线程 GUIThreadInfo 看不
+                        // 到，消息也不经我们的 wndproc）。找到就补 WS_DISABLED——不收任
+                        // 何鼠标键盘输入，命中测试穿透回我们的穿透链；渲染不走输入路径
+                        // 无副作用。换视频重建窗口后会自动再补（幂等）。
+                        let vc: Vec<u16> = "loopsub-video"
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .collect();
+                        let mc: Vec<u16> = "mpv".encode_utf16().chain(std::iter::once(0)).collect();
+                        let video = unsafe {
+                            FindWindowExW(main, std::ptr::null_mut(), vc.as_ptr(), std::ptr::null())
+                        };
+                        if !video.is_null() {
+                            let mpvw = unsafe {
+                                FindWindowExW(
+                                    video,
+                                    std::ptr::null_mut(),
+                                    mc.as_ptr(),
+                                    std::ptr::null(),
+                                )
+                            };
+                            if !mpvw.is_null() {
+                                let style = unsafe { GetWindowLongPtrW(mpvw, GWL_STYLE) };
+                                if style & (WS_DISABLED as isize) == 0 {
+                                    unsafe {
+                                        SetWindowLongPtrW(
+                                            mpvw,
+                                            GWL_STYLE,
+                                            style | (WS_DISABLED as isize),
+                                        )
+                                    };
+                                }
+                                // WS_DISABLED 只断输入不断命中：disabled 窗口的 NCHITTEST
+                                // 仍返回 HTCLIENT，鼠标 down 派发给它后被系统直接丢弃——
+                                // 穿透链断、主窗口不激活（实测病根：点画面窗口不置前）。
+                                // 补 WS_EX_TRANSPARENT 让命中测试整体跳过它（WebView2 自带
+                                // 的 D3D 输出窗口同为 disabled，就靠此样式让位）；只影响
+                                // 命中测试，不影响 mpv 渲染输出
+                                let exstyle = unsafe { GetWindowLongPtrW(mpvw, GWL_EXSTYLE) };
+                                if exstyle & (WS_EX_TRANSPARENT as isize) == 0 {
+                                    unsafe {
+                                        SetWindowLongPtrW(
+                                            mpvw,
+                                            GWL_EXSTYLE,
+                                            exstyle | (WS_EX_TRANSPARENT as isize),
+                                        )
+                                    };
+                                }
                             }
                         }
-                    }
                     }
                 });
             }
@@ -1463,6 +1613,8 @@ pub fn run() {
             mpv_quit,
             mpv_connect,
             mpv_command,
+            mpv_playback_snapshot,
+            set_video_visible,
             load_video,
             search_subtitles,
             download_subtitle,

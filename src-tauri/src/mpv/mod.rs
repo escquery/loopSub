@@ -18,10 +18,25 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, oneshot, Mutex};
+
+/// 前端播放状态的一次聚合快照。进程内 libmpv 通过属性观察事件推送；
+/// 手动 IPC 模式以单次 Tauri 调用聚合读取，避免每 300ms 跨桥七次。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlaybackSnapshot {
+    pub pause: Option<bool>,
+    pub time_pos: Option<f64>,
+    pub duration: Option<f64>,
+    pub percent_pos: Option<f64>,
+    pub speed: Option<f64>,
+    pub sub_delay: Option<f64>,
+    pub sub_speed: Option<f64>,
+    pub ab_loop_a: Option<f64>,
+}
 
 #[derive(Error, Debug)]
 pub enum MpvError {
@@ -175,6 +190,30 @@ impl Mpv {
         }
     }
 
+    /// 单次聚合读取，主要供不具备进程内属性事件的手动 IPC 模式兜底。
+    pub async fn playback_snapshot(&self) -> PlaybackSnapshot {
+        async fn number(mpv: &Mpv, name: &str) -> Option<f64> {
+            mpv.get_property(name)
+                .await
+                .ok()
+                .and_then(|value| value.as_f64())
+        }
+        PlaybackSnapshot {
+            pause: self
+                .get_property("pause")
+                .await
+                .ok()
+                .and_then(|value| value.as_bool()),
+            time_pos: number(self, "time-pos").await,
+            duration: number(self, "duration").await,
+            percent_pos: number(self, "percent-pos").await,
+            speed: number(self, "speed").await,
+            sub_delay: number(self, "sub-delay").await,
+            sub_speed: number(self, "sub-speed").await,
+            ab_loop_a: number(self, "ab-loop-a").await,
+        }
+    }
+
     /// mpv core 是否已退出（Embed：用户直接关了 mpv 窗口；Ipc 无从感知）
     pub fn is_dead(&self) -> bool {
         matches!(self, Self::Embed(e) if e.is_dead())
@@ -225,7 +264,8 @@ mod tests {
             while let Ok(Some(line)) = lines.next_line().await {
                 let v: Value = serde_json::from_str(&line).unwrap();
                 let id = v["request_id"].as_u64().unwrap();
-                let resp = format!("{{\"data\": 42.0, \"request_id\": {id}, \"error\": \"success\"}}\n");
+                let resp =
+                    format!("{{\"data\": 42.0, \"request_id\": {id}, \"error\": \"success\"}}\n");
                 writer.write_all(resp.as_bytes()).await.unwrap();
             }
         });

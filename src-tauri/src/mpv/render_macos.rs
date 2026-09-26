@@ -7,14 +7,16 @@
 #![allow(deprecated)] // NSOpenGLView 在 macOS 12 可用，是 mpv Render API 的稳定后端。
 
 use std::ffi::{c_char, c_int, c_void, CStr};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::{AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSOpenGLContext, NSOpenGLContextParameter, NSOpenGLView, NSWindow, NSWindowOrderingMode,
+    NSOpenGLContext, NSOpenGLContextParameter, NSOpenGLPFAAccelerated, NSOpenGLPFADoubleBuffer,
+    NSOpenGLPFAOpenGLProfile, NSOpenGLPixelFormat, NSOpenGLProfileVersion3_2Core, NSOpenGLView,
+    NSWindow, NSWindowOrderingMode,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use tauri::Manager;
@@ -69,12 +71,13 @@ struct RenderWork {
 
 struct RenderState {
     fns: RenderFns,
-    gl_flush: unsafe extern "C" fn(),
     render_context: usize,
     view: usize,
     gl_context: usize,
     width: AtomicI32,
     height: AtomicI32,
+    /// 窗口最小化/页面隐藏时合并 mpv 更新，不唤醒 OpenGL 渲染线程。
+    visible: AtomicBool,
     gl_lock: Mutex<()>,
     work: Mutex<RenderWork>,
     wake: Condvar,
@@ -121,8 +124,12 @@ unsafe extern "C" fn update_callback(ctx: *mut c_void) {
     let wake = unsafe { &*(ctx as *const RenderWake) };
     if let Ok(mut work) = wake.state.work.lock() {
         if !work.closing {
+            // 隐藏期间只保留一个 pending 标记，不按视频帧率唤醒线程；恢复时
+            // set_visible 会 notify，并由一次 update/render 直接追到最新帧。
             work.pending = true;
-            wake.state.wake.notify_one();
+            if wake.state.visible.load(Ordering::Acquire) {
+                wake.state.wake.notify_one();
+            }
         }
     }
 }
@@ -154,9 +161,15 @@ fn render_loop(state: Arc<RenderState>) {
 }
 
 fn render_frame(state: &RenderState, force: bool) {
+    let render_ctx = state.render_context as RenderContext;
+    // 隐藏切换竞态可能让已唤醒的线程到达这里；此时只消费一次 update。
+    let flags = unsafe { (state.fns.update)(render_ctx) };
+    if !state.visible.load(Ordering::Acquire) {
+        return;
+    }
     let width = state.width.load(Ordering::Acquire);
     let height = state.height.load(Ordering::Acquire);
-    if width <= 0 || height <= 0 {
+    if width <= 0 || height <= 0 || (!force && flags & MPV_RENDER_UPDATE_FRAME == 0) {
         return;
     }
 
@@ -164,12 +177,6 @@ fn render_frame(state: &RenderState, force: bool) {
     unsafe {
         let gl = &*(state.gl_context as *const NSOpenGLContext);
         gl.makeCurrentContext();
-        let render_ctx = state.render_context as RenderContext;
-        let flags = (state.fns.update)(render_ctx);
-        if !force && flags & MPV_RENDER_UPDATE_FRAME == 0 {
-            NSOpenGLContext::clearCurrentContext();
-            return;
-        }
 
         let mut fbo = OpenGlFbo {
             fbo: 0,
@@ -198,9 +205,7 @@ fn render_frame(state: &RenderState, force: bool) {
             NSOpenGLContext::clearCurrentContext();
             return;
         }
-        // NSOpenGLView::defaultPixelFormat 在 Monterey 上可能是单缓冲；仅调用
-        // flushBuffer 不会提交画面，必须显式 glFlush。
-        (state.gl_flush)();
+        // 显式创建的是双缓冲 pixel format；flushBuffer 负责提交并交换后备缓冲。
         gl.flushBuffer();
         (state.fns.report_swap)(render_ctx);
         NSOpenGLContext::clearCurrentContext();
@@ -212,16 +217,12 @@ impl MacRenderer {
         fns: RenderFns,
         mpv: *mut c_void,
         app: &tauri::AppHandle,
+        low_power_video: bool,
     ) -> Result<Self, String> {
         let gl_library = Box::new(unsafe {
             libloading::Library::new("/System/Library/Frameworks/OpenGL.framework/OpenGL")
                 .map_err(|e| format!("加载 macOS OpenGL.framework 失败: {e}"))?
         });
-        let gl_flush = unsafe {
-            *gl_library
-                .get::<unsafe extern "C" fn()>(b"glFlush\0")
-                .map_err(|e| e.to_string())?
-        };
         let gl_library_id = &*gl_library as *const libloading::Library as usize;
         let webview_window = app.get_webview_window("main").ok_or("主窗口不存在")?;
         let window_id = webview_window.ns_window().map_err(|e| e.to_string())? as usize;
@@ -235,7 +236,21 @@ impl MacRenderer {
                 let _ = tx.send(Err("主窗口没有 contentView".to_string()));
                 return;
             };
-            let pixel_format = NSOpenGLView::defaultPixelFormat(mtm);
+            // mpv 0.40+ 的 VideoToolbox/OpenGL 互操作要求 OpenGL >= 3.0；
+            // AppKit 默认 pixel format 在 Monterey 上只给 legacy 2.1。显式使用
+            // 3.2 Core，同时启用硬件加速和双缓冲。
+            let mut attributes = [
+                NSOpenGLPFAOpenGLProfile,
+                NSOpenGLProfileVersion3_2Core,
+                NSOpenGLPFAAccelerated,
+                NSOpenGLPFADoubleBuffer,
+                0,
+            ];
+            let pixel_format = NSOpenGLPixelFormat::initWithAttributes(
+                NSOpenGLPixelFormat::alloc(),
+                std::ptr::NonNull::new(attributes.as_mut_ptr()).unwrap(),
+            )
+            .unwrap_or_else(|| NSOpenGLView::defaultPixelFormat(mtm));
             let Some(view) = NSOpenGLView::initWithFrame_pixelFormat(
                 NSOpenGLView::alloc(mtm),
                 NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
@@ -244,7 +259,9 @@ impl MacRenderer {
                 let _ = tx.send(Err("创建 NSOpenGLView 失败".to_string()));
                 return;
             };
-            view.setWantsBestResolutionOpenGLSurface(true);
+            // 省电模式使用逻辑分辨率 surface，由 WindowServer 缩放到 Retina；
+            // 1080p 视频无需为 2x 输出额外渲染约四倍像素。
+            view.setWantsBestResolutionOpenGLSurface(!low_power_video);
             content.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Above, None);
             view.prepareOpenGL();
             let Some(gl) = view.openGLContext() else {
@@ -313,12 +330,12 @@ impl MacRenderer {
             .map_err(|_| "创建 macOS OpenGL 视频层超时".to_string())??;
         let state = Arc::new(RenderState {
             fns,
-            gl_flush,
             render_context,
             view,
             gl_context,
             width: AtomicI32::new(1),
             height: AtomicI32::new(1),
+            visible: AtomicBool::new(true),
             gl_lock: Mutex::new(()),
             work: Mutex::new(RenderWork::default()),
             wake: Condvar::new(),
@@ -394,6 +411,47 @@ impl MacRenderer {
             drop(_gl_guard);
 
             // resize/1:1 在暂停时未必触发 mpv callback，强制渲染上一帧。
+            if let Ok(mut work) = state.work.lock() {
+                work.force = true;
+                work.pending = true;
+                state.wake.notify_one();
+            }
+        });
+    }
+
+    /// 页面隐藏或窗口最小化时停止提交 OpenGL 帧；恢复时强制重绘上一帧。
+    pub fn set_visible(&self, visible: bool) {
+        let was_visible = self.state.visible.swap(visible, Ordering::AcqRel);
+        if visible && !was_visible {
+            if let Ok(mut work) = self.state.work.lock() {
+                work.force = true;
+                work.pending = true;
+                self.state.wake.notify_one();
+            }
+        }
+    }
+
+    /// 实时切换 Retina surface 分辨率。必须在 AppKit 主线程更新 view/context。
+    pub fn set_low_power_video(&self, low_power: bool) {
+        let state = self.state.clone();
+        let _ = self.app.run_on_main_thread(move || unsafe {
+            if state.work.lock().map(|work| work.closing).unwrap_or(true) {
+                return;
+            }
+            let mtm = MainThreadMarker::new().expect("已在 AppKit 主线程");
+            let view = &*(state.view as *const NSOpenGLView);
+            let gl = &*(state.gl_context as *const NSOpenGLContext);
+            let _gl_guard = state.gl_lock.lock().unwrap();
+            view.setWantsBestResolutionOpenGLSurface(!low_power);
+            gl.update(mtm);
+            let backing = view.convertRectToBacking(view.bounds());
+            state
+                .width
+                .store(backing.size.width.round() as i32, Ordering::Release);
+            state
+                .height
+                .store(backing.size.height.round() as i32, Ordering::Release);
+            drop(_gl_guard);
             if let Ok(mut work) = state.work.lock() {
                 work.force = true;
                 work.pending = true;

@@ -2,6 +2,33 @@
 // 暴露 window.comboOf（键盘事件 → 组合键字符串）与 window.SettingsUI
 'use strict';
 
+const PLATFORM_HINT = String(
+  navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || ''
+);
+const IS_MAC = /mac/i.test(PLATFORM_HINT);
+const IS_WINDOWS = /win/i.test(PLATFORM_HINT);
+
+// 快捷键保存值保持跨平台稳定（alt/meta），只在界面上使用系统习惯名称。
+function displayHotkey(combo) {
+  if (!combo) return '未绑定';
+  return String(combo)
+    .split('+')
+    .map((part) => {
+      switch (part.toLowerCase()) {
+        case 'ctrl': return IS_MAC ? 'Control' : 'Ctrl';
+        case 'alt': return IS_MAC ? 'Option' : 'Alt';
+        case 'shift': return 'Shift';
+        case 'meta': return IS_MAC ? 'Command' : (IS_WINDOWS ? 'Win' : 'Meta');
+        case 'arrowleft': return '←';
+        case 'arrowright': return '→';
+        case 'arrowup': return '↑';
+        case 'arrowdown': return '↓';
+        default: return part;
+      }
+    })
+    .join(' + ');
+}
+
 // 键盘事件 → 规范化组合键，与 Rust 默认表格式一致：
 // 修饰键顺序 ctrl → alt → shift → meta；单字符小写；空格记为 Space；
 // 符号键按物理键（e.code）归一为基键字符——Shift+[ 的 e.key 是 {，而
@@ -23,6 +50,9 @@ window.comboOf = function (e) {
   // 标点键始终按物理键位归一。macOS 拼音输入法下裸 [ / ] 的 e.key 可能是
   // 全角【/】，此前只有带 Shift 时才归一，导致设置 A/B 无响应而取消却正常。
   else if (SHIFT_BASE_KEYS[e.code]) key = SHIFT_BASE_KEYS[e.code];
+  // Option+字母在 macOS 会产生特殊字符（如 Option+X → ≈）；按物理字母键
+  // 归一后，Windows 保存的 alt+x 才能在 macOS 上直接对应 Option+X。
+  else if (/^Key[A-Z]$/.test(e.code)) key = e.code.slice(3).toLowerCase();
   else if (key.length === 1) key = key.toLowerCase();
   parts.push(key);
   return parts.join('+');
@@ -119,8 +149,8 @@ const SettingsUI = {
         </label>
         <label>渲染方式
           <select data-k="subtitle.render">
-            <option value="panel" ${s.subtitle.render === 'panel' ? 'selected' : ''}>面板渲染（默认）</option>
-            <option value="mpv" ${s.subtitle.render === 'mpv' ? 'selected' : ''}>mpv 渲染（ASS 特效）</option>
+            <option value="mpv" ${s.subtitle.render === 'mpv' ? 'selected' : ''}>视频画面显示（默认，与原生 mpv 一致）</option>
+            <option value="panel" ${s.subtitle.render === 'panel' ? 'selected' : ''}>仅右侧面板显示</option>
           </select>
         </label>
         <label>延迟微调步长（毫秒）<input type="number" data-k="subtitle.delay_step_ms" value="${s.subtitle.delay_step_ms}" /></label>
@@ -140,6 +170,7 @@ const SettingsUI = {
       </section>
       <section>
         <h3>窗口</h3>
+        ${IS_MAC ? `<label class="row"><input type="checkbox" data-k="window.macos_low_power_video" ${s.window.macos_low_power_video ? 'checked' : ''} /> 省电视频渲染（推荐，限制 Retina 视频层分辨率）</label>` : ''}
         <label class="row"><input type="checkbox" data-k="window.sink_on_blur" ${s.window.sink_on_blur ? 'checked' : ''} /> 切走时取消置顶（沉底）</label>
         <label class="row"><input type="checkbox" data-k="window.recall_mpv_on_focus" ${s.window.recall_mpv_on_focus ? 'checked' : ''} /> 切回时召回 mpv 窗口</label>
       </section>
@@ -160,7 +191,7 @@ const SettingsUI = {
             .map(
               ([action, label]) => `<tr>
                 <td>${label}</td>
-                <td><button class="hk" data-action="${action}">${esc(s.hotkeys[action] ?? '未绑定')}</button></td>
+                <td><button class="hk" data-action="${action}" title="点击修改">${esc(displayHotkey(s.hotkeys[action]))}</button></td>
               </tr>`
             )
             .join('')}

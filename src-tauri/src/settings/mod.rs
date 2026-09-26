@@ -37,8 +37,15 @@ pub struct AudioSettings {
 pub struct SubtitleSettings {
     pub truecase: TruecaseMode,
     pub render: RenderMode,
+    /// v2 起 Windows/macOS 默认都在视频画面显示字幕；旧配置缺少此标记时迁移一次。
+    #[serde(default = "render_default_v2_pending")]
+    pub render_default_v2: bool,
     /// 延迟微调步长（毫秒）
     pub delay_step_ms: u32,
+}
+
+fn render_default_v2_pending() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,9 +58,9 @@ pub enum TruecaseMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderMode {
-    /// 面板字幕条渲染（默认），mpv 侧 sub-visibility=no
+    /// 仅右侧面板显示，mpv 侧 sub-visibility=no
     Panel,
-    /// 交给 mpv 渲染（ASS 特效字幕场景）
+    /// 交给 mpv 在视频画面渲染（默认）
     Mpv,
 }
 
@@ -103,6 +110,9 @@ pub struct BinSettings {
 #[serde(default)]
 pub struct WindowSettings {
     pub dock_side: DockSide,
+    /// macOS 省电模式：OpenGL 视频层使用逻辑分辨率，由系统缩放到 Retina。
+    /// 视频解码分辨率不变，只减少输出 FBO 和窗口合成像素数。
+    pub macos_low_power_video: bool,
     /// 焦点去无关应用时取消 always-on-top 让面板沉底
     pub sink_on_blur: bool,
     /// 切回面板时主动召回 mpv 窗口到面板下方
@@ -156,7 +166,8 @@ impl Default for SubtitleSettings {
     fn default() -> Self {
         Self {
             truecase: TruecaseMode::Rule,
-            render: RenderMode::Panel,
+            render: RenderMode::Mpv,
+            render_default_v2: true,
             delay_step_ms: 100,
         }
     }
@@ -189,6 +200,7 @@ impl Default for WindowSettings {
     fn default() -> Self {
         Self {
             dock_side: DockSide::Right,
+            macos_low_power_video: true,
             sink_on_blur: true,
             recall_mpv_on_focus: true,
             float_bar: false,
@@ -205,7 +217,7 @@ impl Default for TruecaseMode {
 
 impl Default for RenderMode {
     fn default() -> Self {
-        RenderMode::Panel
+        RenderMode::Mpv
     }
 }
 
@@ -280,8 +292,8 @@ pub fn default_hotkeys() -> HashMap<String, String> {
 impl Settings {
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let mut settings: Settings =
-            serde_json::from_str(&content).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut settings: Settings = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // 迁移：ab_clear/ab_clear_alt 曾把 shift+[/] 当作“取消 AB 循环”的双键，
         // 实为误读——两个键应分别取消 A/B 点（ab_clear_a/ab_clear_b）。
         // 未改绑过的残留清掉，由下方补缺循环挂上新默认；ab_clear_alt 已废弃一律移除。
@@ -289,9 +301,19 @@ impl Settings {
             settings.hotkeys.remove("ab_clear");
         }
         settings.hotkeys.remove("ab_clear_alt");
+        // 旧版默认是仅面板显示。升级后迁移一次到 mpv 画面字幕，使 Windows/macOS
+        // 行为一致；标记落盘后用户仍可主动切回仅面板模式。
+        let migrate_render_default = !settings.subtitle.render_default_v2;
+        if migrate_render_default {
+            settings.subtitle.render = RenderMode::Mpv;
+            settings.subtitle.render_default_v2 = true;
+        }
         // 老配置补挂新版本新增的默认热键（仅补缺项；设置页无解绑功能，不会误恢复）
         for (action, combo) in default_hotkeys() {
             settings.hotkeys.entry(action).or_insert(combo);
+        }
+        if migrate_render_default {
+            let _ = settings.save(path);
         }
         Ok(settings)
     }
@@ -303,5 +325,36 @@ impl Settings {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(path, content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_power_setting_uses_low_power_default() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"window":{"sink_on_blur":false}}"#).unwrap();
+        assert!(settings.window.macos_low_power_video);
+    }
+
+    #[test]
+    fn old_panel_default_migrates_once_to_mpv() {
+        let path = std::env::temp_dir().join(format!(
+            "loopsub_settings_render_migration_{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, r#"{"subtitle":{"render":"panel"}}"#).unwrap();
+
+        let mut settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.subtitle.render, RenderMode::Mpv);
+        assert!(settings.subtitle.render_default_v2);
+
+        settings.subtitle.render = RenderMode::Panel;
+        settings.save(&path).unwrap();
+        let reloaded = Settings::load(&path).unwrap();
+        assert_eq!(reloaded.subtitle.render, RenderMode::Panel);
+        std::fs::remove_file(path).ok();
     }
 }

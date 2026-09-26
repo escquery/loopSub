@@ -21,7 +21,7 @@ loopSub ──dlopen──> libmpv         （播放控制全部进程内调用�
 loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 ```
 
-由此不需要全局热键。libmpv 以 dlopen 方式进程内加载（无子进程、无 IPC 连接与重试），以 `osc=no input-default-bindings=no` 初始化；Windows 输出到自建 Win32 子窗口，macOS 通过 libmpv Render API 输出到主窗口内的 Retina `NSOpenGLView`，并启用 VideoToolbox 硬件解码。
+由此不需要全局热键。libmpv 以 dlopen 方式进程内加载（无子进程、无 IPC 连接与重试），以 `osc=no input-default-bindings=no hwdec=auto-safe` 初始化；Windows 输出到自建 Win32 子窗口并优先使用 D3D11VA，macOS 通过 libmpv Render API 输出到主窗口内的 OpenGL 3.2 双缓冲 `NSOpenGLView` 并使用 VideoToolbox。
 
 ## 功能
 
@@ -36,6 +36,7 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 - 内嵌字幕：`ffprobe` 探测 → `ffmpeg` 导出文本轨（图形轨 PGS/VobSub 自动识别并提示）
 - OpenSubtitles 搜索：moviehash 精确匹配 → 文件名解析（S01E03 / release 组）回退列候选
 - EIA-608 全大写内嵌字幕的大写还原（规则法 / LLM 法）
+- Windows/macOS 默认均在视频画面显示 mpv 字幕，同时保留句子面板；可切换为仅面板显示且立即生效
 - 字幕-音频自动对齐（🎯 一键触发）：能量包络互相关估偏移与语速，自研简化 ffsubsync 零外部依赖；结果只写 mpv 属性可逆，按视频记忆自动恢复
 
 **LLM 整集翻译**（OpenAI 兼容 API：DeepSeek / vLLM / 任意兼容端点）
@@ -49,6 +50,8 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 - 最近播放历史（MRU 20 条，失效自动剔除）+ 播放位置记忆（≥5s 自动续播）
 - 常亮状态徽章（AB / 跟读 / 译文 / 速度 / 延迟），点击即关闭
 - macOS 单窗口右侧字幕面板始终完整展开并常驻，不随播放/暂停自动缩放
+- 播放状态由 libmpv 属性事件合并推送，不再由 WebView 每 300ms 多属性轮询
+- 窗口最小化、隐藏或被完全覆盖时停止提交视频帧；macOS 默认启用可关闭的 Retina 省电渲染
 
 **窗口与系统集成**
 - 失焦自动沉底、切回自动召回与置顶（均可在设置页关闭）

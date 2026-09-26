@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
+use super::PlaybackSnapshot;
 use serde_json::Value;
 use tauri::Emitter;
 
@@ -25,6 +27,7 @@ const MPV_FORMAT_INT64: c_int = 4;
 const MPV_FORMAT_DOUBLE: c_int = 5;
 const MPV_EVENT_SHUTDOWN: c_int = 1;
 const MPV_EVENT_CLIENT_MESSAGE: c_int = 16;
+const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
 
 /// 只需读首字段；后续字段按 client.h 原样排布以保证偏移正确
 #[repr(C)]
@@ -41,6 +44,14 @@ struct MpvEvent {
 struct MpvEventClientMessage {
     num_args: c_int,
     args: *mut *const c_char,
+}
+
+/// MPV_EVENT_PROPERTY_CHANGE 的 data（client.h: mpv_event_property）。
+#[repr(C)]
+struct MpvEventProperty {
+    name: *const c_char,
+    format: c_int,
+    data: *mut c_void,
 }
 
 type Handle = *mut c_void;
@@ -60,6 +71,7 @@ pub struct MpvApi {
     get_property: unsafe extern "C" fn(Handle, *const c_char, c_int, *mut c_void) -> c_int,
     get_property_string: unsafe extern "C" fn(Handle, *const c_char) -> *mut c_char,
     set_property_string: unsafe extern "C" fn(Handle, *const c_char, *const c_char) -> c_int,
+    observe_property: unsafe extern "C" fn(Handle, u64, *const c_char, c_int) -> c_int,
     wait_event: unsafe extern "C" fn(Handle, f64) -> *mut MpvEvent,
     terminate_destroy: unsafe extern "C" fn(Handle),
     free: unsafe extern "C" fn(*mut c_void),
@@ -90,7 +102,10 @@ impl MpvApi {
                 };
             }
             let api = Self {
-                client_api_version: sym!("mpv_client_api_version", unsafe extern "C" fn() -> c_ulong),
+                client_api_version: sym!(
+                    "mpv_client_api_version",
+                    unsafe extern "C" fn() -> c_ulong
+                ),
                 create: sym!("mpv_create", unsafe extern "C" fn() -> Handle),
                 initialize: sym!("mpv_initialize", unsafe extern "C" fn(Handle) -> c_int),
                 set_option: sym!(
@@ -120,6 +135,10 @@ impl MpvApi {
                 set_property_string: sym!(
                     "mpv_set_property_string",
                     unsafe extern "C" fn(Handle, *const c_char, *const c_char) -> c_int
+                ),
+                observe_property: sym!(
+                    "mpv_observe_property",
+                    unsafe extern "C" fn(Handle, u64, *const c_char, c_int) -> c_int
                 ),
                 wait_event: sym!(
                     "mpv_wait_event",
@@ -263,7 +282,14 @@ impl MpvEmbed {
             ("idle", "yes"),
             // RenderContext 必须在第一次 VO 创建前就绪；macOS 不让 force-window
             // 在 mpv_initialize 后抢先回退到 Cocoa 独立窗口。
-            ("force-window", if cfg!(target_os = "macos") { "no" } else { "yes" }),
+            (
+                "force-window",
+                if cfg!(target_os = "macos") {
+                    "no"
+                } else {
+                    "yes"
+                },
+            ),
             ("osc", "no"),
             ("input-default-bindings", "no"),
             ("keep-open", "yes"),
@@ -280,19 +306,62 @@ impl MpvEmbed {
             api.check(code)
                 .map_err(|e| format!("设置 {k}={v} 失败: {e}"))?;
         }
+        // 新版 mpv 不再因创建 RenderContext 自动把默认 VO 切为 libmpv；
+        // 必须在 initialize 前明确指定，否则会探测独立 gpu-next 输出并得到黑屏。
         #[cfg(target_os = "macos")]
         {
-            let key = CString::new("hwdec").unwrap();
-            let value = CString::new("auto-safe").unwrap();
+            let key = CString::new("vo").unwrap();
+            let value = CString::new("libmpv").unwrap();
             api.check(unsafe { (api.set_option_string)(handle, key.as_ptr(), value.as_ptr()) })
-                .map_err(|e| format!("启用 VideoToolbox 硬件解码失败: {e}"))?;
+                .map_err(|e| format!("设置 macOS Render API 输出失败: {e}"))?;
         }
+
+        // mpv 默认通常关闭硬件解码。auto-safe 在 Windows 选择安全的 D3D11VA，
+        // 在 macOS 选择 VideoToolbox；无可用设备时由 mpv 自动回退软件解码。
+        let key = CString::new("hwdec").unwrap();
+        let value = CString::new("auto-safe").unwrap();
+        api.check(unsafe { (api.set_option_string)(handle, key.as_ptr(), value.as_ptr()) })
+            .map_err(|e| format!("启用安全硬件解码失败: {e}"))?;
         Ok(())
     }
 
-    /// 事件线程：消费事件队列，侦测 SHUTDOWN（用户直接关了 mpv 窗口）。
-    /// wait_event 用 200ms 超时轮询而非永久阻塞：terminate_destroy 的 unblock
-    /// 承诺偶发失效（实测 join 永久卡死），超时+closing 标志保证 join 有硬上界。
+    /// 从 libmpv 的类型化 property-change 事件更新聚合快照。
+    fn update_playback_snapshot(event: &MpvEvent, snapshot: &mut PlaybackSnapshot) -> bool {
+        let property = event.data as *const MpvEventProperty;
+        if property.is_null() {
+            return false;
+        }
+        unsafe {
+            if (*property).name.is_null() {
+                return false;
+            }
+            let name = CStr::from_ptr((*property).name).to_string_lossy();
+            let double = || {
+                ((*property).format == MPV_FORMAT_DOUBLE && !(*property).data.is_null())
+                    .then(|| *((*property).data as *const f64))
+            };
+            match name.as_ref() {
+                "pause" => {
+                    snapshot.pause = ((*property).format == MPV_FORMAT_FLAG
+                        && !(*property).data.is_null())
+                    .then(|| *((*property).data as *const c_int) != 0);
+                }
+                "time-pos" => snapshot.time_pos = double(),
+                "duration" => snapshot.duration = double(),
+                "speed" => snapshot.speed = double(),
+                "sub-delay" => snapshot.sub_delay = double(),
+                "sub-speed" => snapshot.sub_speed = double(),
+                "ab-loop-a" => snapshot.ab_loop_a = double(),
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// 事件线程：消费事件队列，侦测 SHUTDOWN，并把频繁属性变化合并为
+    /// 最多每 200ms 一次的播放状态事件。前端不再跨 WebView 桥逐项轮询。
+    /// wait_event 用短超时而非永久阻塞：terminate_destroy 的 unblock 承诺偶发
+    /// 失效（实测 join 永久卡死），超时+closing 标志保证 join 有硬上界。
     fn spawn_event_thread(
         api: &Arc<MpvApi>,
         handle: Handle,
@@ -308,11 +377,14 @@ impl MpvEmbed {
             let handle = handle as usize;
             move || {
                 let handle = handle as Handle;
+                let mut playback = PlaybackSnapshot::default();
+                let mut playback_dirty = false;
+                let mut last_playback_emit = Instant::now();
                 loop {
                     if closing.load(Ordering::SeqCst) {
                         break;
                     }
-                    let ev = unsafe { (api.wait_event)(handle, 0.2) };
+                    let ev = unsafe { (api.wait_event)(handle, 0.1) };
                     if closing.load(Ordering::SeqCst) {
                         break;
                     }
@@ -326,25 +398,34 @@ impl MpvEmbed {
                         }
                         MPV_EVENT_CLIENT_MESSAGE => unsafe {
                             let data = (*ev).data as *const MpvEventClientMessage;
-                            if data.is_null() || (*data).args.is_null() || (*data).num_args < 2 {
-                                continue;
-                            }
-                            let args = std::slice::from_raw_parts(
-                                (*data).args,
-                                (*data).num_args as usize,
-                            );
-                            let arg = |i: usize| {
-                                args.get(i)
-                                    .filter(|p| !p.is_null())
-                                    .map(|p| CStr::from_ptr(*p).to_string_lossy().into_owned())
-                            };
-                            if arg(0).as_deref() == Some("loopsub-hotkey") {
-                                if let Some(action) = arg(1) {
-                                    let _ = app.emit("mpv-hotkey", action);
+                            if !data.is_null() && !(*data).args.is_null() && (*data).num_args >= 2 {
+                                let args = std::slice::from_raw_parts(
+                                    (*data).args,
+                                    (*data).num_args as usize,
+                                );
+                                let arg = |i: usize| {
+                                    args.get(i)
+                                        .filter(|p| !p.is_null())
+                                        .map(|p| CStr::from_ptr(*p).to_string_lossy().into_owned())
+                                };
+                                if arg(0).as_deref() == Some("loopsub-hotkey") {
+                                    if let Some(action) = arg(1) {
+                                        let _ = app.emit("mpv-hotkey", action);
+                                    }
                                 }
                             }
                         },
+                        MPV_EVENT_PROPERTY_CHANGE => {
+                            playback_dirty |=
+                                Self::update_playback_snapshot(unsafe { &*ev }, &mut playback);
+                        }
                         _ => {}
+                    }
+                    if playback_dirty && last_playback_emit.elapsed() >= Duration::from_millis(200)
+                    {
+                        let _ = app.emit("mpv-playback-state", playback.clone());
+                        playback_dirty = false;
+                        last_playback_emit = Instant::now();
                     }
                 }
             }
@@ -355,7 +436,12 @@ impl MpvEmbed {
     /// layout：Windows 下 Some = 子窗口嵌入主窗口（Phase C 单窗口），
     /// None = 自建顶层视频窗口（Phase B）；创建/wid 失败均降级为 mpv 自建窗口。
     /// app 用于把子窗口创建投递到主线程（非 Windows 忽略）。
-    pub fn new(api: Arc<MpvApi>, layout: Option<VidLayout>, app: &tauri::AppHandle) -> Result<Self, String> {
+    pub fn new(
+        api: Arc<MpvApi>,
+        layout: Option<VidLayout>,
+        app: &tauri::AppHandle,
+        low_power_video: bool,
+    ) -> Result<Self, String> {
         let handle = unsafe { (api.create)() };
         if handle.is_null() {
             return Err("mpv_create 失败".into());
@@ -376,7 +462,11 @@ impl MpvEmbed {
                         let (tx, rx) = std::sync::mpsc::channel();
                         match app.run_on_main_thread(move || {
                             let _ = tx.send(super::vidwin::VideoWindow::create_child(
-                                l.parent as _, l.x, l.y, l.w, l.h,
+                                l.parent as _,
+                                l.x,
+                                l.y,
+                                l.w,
+                                l.h,
                             ));
                         }) {
                             Ok(()) => rx.recv().unwrap_or_else(|_| Err("主线程已退出".into())),
@@ -417,14 +507,39 @@ impl MpvEmbed {
         };
         #[cfg(not(windows))]
         let _ = layout;
+        #[cfg(not(target_os = "macos"))]
+        let _ = low_power_video;
 
         if let Err(e) = api.check(unsafe { (api.initialize)(handle) }) {
             unsafe { (api.terminate_destroy)(handle) };
             return Err(format!("mpv_initialize 失败: {e}"));
         }
 
+        // 进程内实例使用 Client API 观察播放状态；事件线程会合并高频 time-pos
+        // 变化后推送给前端。单个属性观察失败不影响播放器启动。
+        for (id, name, format) in [
+            (1, "pause", MPV_FORMAT_FLAG),
+            (2, "time-pos", MPV_FORMAT_DOUBLE),
+            (3, "duration", MPV_FORMAT_DOUBLE),
+            (4, "speed", MPV_FORMAT_DOUBLE),
+            (5, "sub-delay", MPV_FORMAT_DOUBLE),
+            (6, "sub-speed", MPV_FORMAT_DOUBLE),
+            (7, "ab-loop-a", MPV_FORMAT_DOUBLE),
+        ] {
+            let property = CString::new(name).unwrap();
+            let code = unsafe { (api.observe_property)(handle, id, property.as_ptr(), format) };
+            if let Err(e) = api.check(code) {
+                eprintln!("[embed] observe {name} failed: {e}");
+            }
+        }
+
         #[cfg(target_os = "macos")]
-        let renderer = match super::render_macos::MacRenderer::create(api.render, handle, app) {
+        let renderer = match super::render_macos::MacRenderer::create(
+            api.render,
+            handle,
+            app,
+            low_power_video,
+        ) {
             Ok(renderer) => renderer,
             Err(e) => {
                 unsafe { (api.terminate_destroy)(handle) };
@@ -484,7 +599,9 @@ impl MpvEmbed {
             },
             "set_property" if args.len() == 3 => match args[1].as_str() {
                 Some(name) => {
-                    return self.set_property_value(name, args[2].clone()).map(|_| Value::Null)
+                    return self
+                        .set_property_value(name, args[2].clone())
+                        .map(|_| Value::Null)
                 }
                 None => return Err("set_property 属性名须为字符串".into()),
             },
@@ -577,6 +694,26 @@ impl MpvEmbed {
     pub fn set_render_layout(&self, drawer_w: f64, top_h: f64, bottom_h: f64) {
         if let Some(renderer) = self.renderer.lock().unwrap().as_ref() {
             renderer.set_layout(drawer_w, top_h, bottom_h);
+        }
+    }
+
+    /// 页面隐藏/主窗口最小化时停止提交视频帧。音频和播放时钟继续运行，
+    /// 恢复后直接显示当前帧，不改变用户的暂停状态。
+    pub fn set_video_visible(&self, visible: bool) {
+        #[cfg(windows)]
+        let _ = self.with_vidwin(|window| window.set_visible(visible));
+        #[cfg(target_os = "macos")]
+        if let Some(renderer) = self.renderer.lock().unwrap().as_ref() {
+            renderer.set_visible(visible);
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = visible;
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_low_power_video(&self, low_power: bool) {
+        if let Some(renderer) = self.renderer.lock().unwrap().as_ref() {
+            renderer.set_low_power_video(low_power);
         }
     }
 
@@ -698,15 +835,35 @@ fn combo_to_mpv(combo: &str) -> Option<String> {
     );
     if shift && !is_special {
         let shifted = match key.as_str() {
-            "[" => Some("{"), "]" => Some("}"), "," => Some("<"), "." => Some(">"),
-            "/" => Some("?"), "\\" => Some("|"), ";" => Some(":"), "'" => Some("\""),
-            "-" => Some("_"), "=" => Some("+"), "`" => Some("~"), "1" => Some("!"),
-            "2" => Some("@"), "3" => Some("#"), "4" => Some("$"), "5" => Some("%"),
-            "6" => Some("^"), "7" => Some("&"), "8" => Some("*"), "9" => Some("("),
-            "0" => Some(")"), _ => None,
+            "[" => Some("{"),
+            "]" => Some("}"),
+            "," => Some("<"),
+            "." => Some(">"),
+            "/" => Some("?"),
+            "\\" => Some("|"),
+            ";" => Some(":"),
+            "'" => Some("\""),
+            "-" => Some("_"),
+            "=" => Some("+"),
+            "`" => Some("~"),
+            "1" => Some("!"),
+            "2" => Some("@"),
+            "3" => Some("#"),
+            "4" => Some("$"),
+            "5" => Some("%"),
+            "6" => Some("^"),
+            "7" => Some("&"),
+            "8" => Some("*"),
+            "9" => Some("("),
+            "0" => Some(")"),
+            _ => None,
         };
         if let Some(produced) = shifted {
-            key = if produced == "#" { "SHARP".into() } else { produced.into() };
+            key = if produced == "#" {
+                "SHARP".into()
+            } else {
+                produced.into()
+            };
         } else if key.chars().count() == 1 && key.chars().all(|c| c.is_ascii_alphabetic()) {
             key.make_ascii_uppercase();
         } else {
@@ -723,7 +880,11 @@ pub fn hotkey_section(hotkeys: &HashMap<String, String>) -> String {
     let mut rows: Vec<_> = hotkeys.iter().collect();
     rows.sort_by(|a, b| a.0.cmp(b.0));
     rows.into_iter()
-        .filter(|(action, _)| action.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|(action, _)| {
+            action
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
         .filter_map(|(action, combo)| {
             combo_to_mpv(combo).map(|key| {
                 let mut keys = vec![key.clone()];
@@ -767,7 +928,10 @@ mod tests {
     #[test]
     fn converts_browser_combos_to_mpv_keys() {
         assert_eq!(combo_to_mpv("Space").as_deref(), Some("SPACE"));
-        assert_eq!(combo_to_mpv("alt+shift+ArrowLeft").as_deref(), Some("Alt+Shift+LEFT"));
+        assert_eq!(
+            combo_to_mpv("alt+shift+ArrowLeft").as_deref(),
+            Some("Alt+Shift+LEFT")
+        );
         assert_eq!(combo_to_mpv("ctrl+[").as_deref(), Some("Ctrl+["));
         // mpv 会忽略文本键显式 Shift；必须绑定实际产生的花括号。
         assert_eq!(combo_to_mpv("shift+[").as_deref(), Some("{"));
@@ -776,10 +940,8 @@ mod tests {
 
     #[test]
     fn configured_prefix_lib_is_found() {
-        let root = std::env::temp_dir().join(format!(
-            "loopsub-libmpv-prefix-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("loopsub-libmpv-prefix-{}", std::process::id()));
         let lib = root.join("lib").join(system_dll_name());
         std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
         std::fs::write(&lib, b"fake").unwrap();

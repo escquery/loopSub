@@ -27,6 +27,10 @@ const state = {
   delayStep: 0.1,
   subDelay: 0,
   subSpeed: 1,
+  playbackPos: 0,
+  playbackPaused: false,
+  abLoopA: null,
+  playbackEventsAvailable: false,
 };
 
 // 禁用 WebView2 默认右键菜单（播放器 UI 不应露浏览器菜单）；输入框保留编辑菜单
@@ -122,6 +126,8 @@ async function loadVideo(path) {
     state.lines = res.lines;
     state.translations = {};
     state.currentIdx = -1;
+    state.playbackPos = 0;
+    state.abLoopA = null;
     state.selected.clear();
     resetTranslationUi();
     markConnected();
@@ -179,6 +185,11 @@ listen('video-load-progress', (e) => {
   if (state.loading) showVideoLoadStatus(message);
 });
 
+// 最小化/隐藏应用时停止原生视频层提交帧，但不改变播放时钟和音频状态。
+document.addEventListener('visibilitychange', () => {
+  invoke('set_video_visible', { visible: document.visibilityState === 'visible' }).catch(() => {});
+});
+
 // 历史记录下拉（页面内渲染，原生 select 弹出层会被置顶面板盖住）
 async function refreshHistory() {
   let entries = [];
@@ -220,13 +231,10 @@ listen('tauri://drag-drop', (e) => {
   if (paths && paths.length > 0) loadVideo(paths[0]);
 });
 
-// 播放位置记忆：每 5s 上报一次（异常退出最多丢 5s）
-setInterval(async () => {
-  if (!state.connected || !state.videoPath) return;
-  const pos = await mpv('get_property', 'time-pos');
-  if (typeof pos === 'number' && pos > 0) {
-    invoke('save_playback_position', { positionS: pos }).catch(() => {});
-  }
+// 播放位置记忆：复用后端推送的播放位置，不再额外查询 mpv。
+setInterval(() => {
+  if (!state.connected || !state.videoPath || state.playbackPos <= 0) return;
+  invoke('save_playback_position', { positionS: state.playbackPos }).catch(() => {});
 }, 5000);
 
 // 手动连接已运行的 mpv（高级）
@@ -235,6 +243,8 @@ $('#btn-connect').addEventListener('click', async () => {
   if (!socketPath) return;
   try {
     await invoke('mpv_connect', { socketPath });
+    // 外部 mpv 没有进程内事件转发，使用单次聚合读取兜底。
+    state.playbackEventsAvailable = false;
     markConnected();
   } catch (e) {
     $('#conn-status').textContent = '连接失败: ' + e;
@@ -578,25 +588,31 @@ $('#progress-bar').addEventListener('mousedown', (e) => {
 document.addEventListener('mousemove', (e) => { if (progressDragging) seekToClientX(e.clientX); });
 document.addEventListener('mouseup', () => { progressDragging = false; });
 
-// ---------- 轮询播放状态 ----------
-setInterval(async () => {
-  if (!state.connected) return;
-  const paused = await mpv('get_property', 'pause');
-  const pos = await mpv('get_property', 'time-pos');
-  const delay = await mpv('get_property', 'sub-delay');
-  const subSpeed = await mpv('get_property', 'sub-speed');
+// ---------- 播放状态（libmpv 属性事件；外部 IPC 低频聚合兜底） ----------
+function applyPlaybackState(playback) {
+  const paused = playback?.pause;
+  const pos = playback?.time_pos;
+  const delay = playback?.sub_delay;
+  const subSpeed = playback?.sub_speed;
+  if (typeof paused === 'boolean') state.playbackPaused = paused;
   if (typeof delay === 'number') state.subDelay = delay;
   if (typeof subSpeed === 'number' && subSpeed > 0) state.subSpeed = subSpeed;
-  // 进度条跟新（拖动中由拖动逻辑接管，避免覆盖打架）
+  state.abLoopA = typeof playback?.ab_loop_a === 'number' ? playback.ab_loop_a : null;
+
+  // 进度条更新（拖动中由拖动逻辑接管，避免覆盖打架）。
   if (singleMode && !progressDragging) {
-    const pct = await mpv('get_property', 'percent-pos');
+    let pct = playback?.percent_pos;
+    if (typeof pct !== 'number' && typeof pos === 'number' && playback?.duration > 0) {
+      pct = pos / playback.duration * 100;
+    }
     if (typeof pct === 'number') progressFill.style.width = pct + '%';
   }
   if (typeof pos === 'number') {
+    state.playbackPos = pos;
     if (singleMode) $('#pos-time').textContent = fmtTime(pos * 1000);
     if (state.lines.length > 0) {
-      // 面板字幕也必须使用 mpv 的 sub-delay/sub-speed 时间映射，否则 macOS
-      // 默认面板模式下“自动对齐”和延迟微调只改了隐藏字幕，界面毫无变化。
+      // 面板字幕也必须使用 mpv 的 sub-delay/sub-speed 时间映射，否则
+      // “自动对齐”和延迟微调只改视频字幕，右侧句子不会同步。
       const subPosMs = mediaToSubtitleMs(pos);
       setCurrent(findCurrent(subPosMs));
       if (state.followMode && state.currentIdx >= 0) {
@@ -609,22 +625,34 @@ setInterval(async () => {
       }
     }
   }
-  const speed = await mpv('get_property', 'speed');
-  if (typeof speed === 'number') $('#speed-label').textContent = speed.toFixed(1) + 'x';
-  updateBadges(paused, state.subDelay);
-}, 300);
+  if (typeof playback?.speed === 'number') {
+    $('#speed-label').textContent = playback.speed.toFixed(1) + 'x';
+  }
+  updateBadges();
+}
+
+listen('mpv-playback-state', (e) => {
+  state.playbackEventsAvailable = true;
+  applyPlaybackState(e.payload);
+});
+
+// 手动连接外部 mpv 时没有进程内事件线程；每 500ms 只跨桥一次，后端聚合读取。
+setInterval(async () => {
+  if (!state.connected || state.playbackEventsAvailable) return;
+  try {
+    applyPlaybackState(await invoke('mpv_playback_snapshot'));
+  } catch {}
+}, 500);
 
 // ---------- 状态徽章（点击即关闭对应功能） ----------
-async function updateBadges(paused, delay) {
-  // 未设置 AB 点时 mpv 侧读 ab-loop-a 报错，catch 兜底为 null（badge 不显示）
-  const abA = await mpv('get_property', 'ab-loop-a').catch(() => null);
+function updateBadges() {
   const badges = [];
-  if (paused) badges.push({ id: 'paused', label: '暂停' });
-  if (typeof abA === 'number') badges.push({ id: 'ab', label: 'AB循环' });
+  if (state.playbackPaused) badges.push({ id: 'paused', label: '暂停' });
+  if (typeof state.abLoopA === 'number') badges.push({ id: 'ab', label: 'AB循环' });
   if (state.sentenceLoop) badges.push({ id: 'loop', label: '单句循环' });
   if (state.followMode) badges.push({ id: 'follow', label: '跟读' });
-  if (typeof delay === 'number' && Math.abs(delay) > 0.001) {
-    badges.push({ id: 'delay', label: `字幕${delay > 0 ? '+' : ''}${delay.toFixed(1)}s` });
+  if (Math.abs(state.subDelay) > 0.001) {
+    badges.push({ id: 'delay', label: `字幕${state.subDelay > 0 ? '+' : ''}${state.subDelay.toFixed(1)}s` });
   }
   $('#status-badges').innerHTML = badges
     .map((b) => `<button class="badge" data-badge="${b.id}" title="点击关闭">${b.label}</button>`)
@@ -719,6 +747,7 @@ async function toggleSentenceLoop() {
 function toggleFollow() {
   state.followMode = !state.followMode;
   state.followPausedIdx = -1;
+  updateBadges();
   osd(state.followMode ? '跟读模式 开' : '跟读模式 关');
 }
 
