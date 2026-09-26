@@ -1766,6 +1766,7 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "objc2-open-gl",
  "regex",
  "reqwest 0.12.28",
  "serde",

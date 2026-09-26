@@ -35,3 +35,4 @@ windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "W
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSGraphics", "NSOpenGL", "NSOpenGLView", "objc2-open-gl", "NSResponder", "NSScreen", "NSView", "NSWindow"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "objc2-core-foundation"] }
+objc2-open-gl = { version = "0.3", default-features = false, features = ["CGLTypes"] }

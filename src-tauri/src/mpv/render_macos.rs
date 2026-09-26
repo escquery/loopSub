@@ -7,7 +7,7 @@
 #![allow(deprecated)] // NSOpenGLView 在 macOS 12 可用，是 mpv Render API 的稳定后端。
 
 use std::ffi::{c_char, c_int, c_void, CStr};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -19,6 +19,7 @@ use objc2_app_kit::{
     NSWindow, NSWindowOrderingMode,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_open_gl::{CGLContextObj, CGLError, CGLLockContext, CGLUnlockContext};
 use tauri::Manager;
 
 pub type RenderContext = *mut c_void;
@@ -74,13 +75,44 @@ struct RenderState {
     render_context: usize,
     view: usize,
     gl_context: usize,
+    gl_finish: unsafe extern "C" fn(),
     width: AtomicI32,
     height: AtomicI32,
     /// 窗口最小化/页面隐藏时合并 mpv 更新，不唤醒 OpenGL 渲染线程。
     visible: AtomicBool,
+    /// AppKit 缩放窗口时会异步替换 OpenGL drawable。动画稳定前不提交新帧，
+    /// 避免 AppleMetalOpenGLRenderer 仍引用已释放的默认 framebuffer texture。
+    surface_changing: AtomicBool,
+    surface_generation: AtomicU64,
     gl_lock: Mutex<()>,
     work: Mutex<RenderWork>,
     wake: Condvar,
+}
+
+/// 除进程内 mutex 外还必须使用 CGL 自身的 context lock。AppKit 在主线程更新
+/// NSOpenGLView drawable，渲染发生在专用线程；只锁我们的两个调用点无法与驱动的
+/// drawable 更新串行，窗口 Zoom 动画下会在 GLDTextureRec 中触发悬空引用。
+struct CglContextLock {
+    context: CGLContextObj,
+    locked: bool,
+}
+
+impl CglContextLock {
+    unsafe fn acquire(gl: &NSOpenGLContext) -> Self {
+        let context = gl.CGLContextObj();
+        let locked = !context.is_null() && CGLLockContext(context) == CGLError::NoError;
+        Self { context, locked }
+    }
+}
+
+impl Drop for CglContextLock {
+    fn drop(&mut self) {
+        if self.locked {
+            unsafe {
+                let _ = CGLUnlockContext(self.context);
+            }
+        }
+    }
 }
 
 // AppKit objects are only dereferenced on the AppKit thread, except NSOpenGLContext's
@@ -127,7 +159,9 @@ unsafe extern "C" fn update_callback(ctx: *mut c_void) {
             // 隐藏期间只保留一个 pending 标记，不按视频帧率唤醒线程；恢复时
             // set_visible 会 notify，并由一次 update/render 直接追到最新帧。
             work.pending = true;
-            if wake.state.visible.load(Ordering::Acquire) {
+            if wake.state.visible.load(Ordering::Acquire)
+                && !wake.state.surface_changing.load(Ordering::Acquire)
+            {
                 wake.state.wake.notify_one();
             }
         }
@@ -154,17 +188,45 @@ fn render_loop(state: Arc<RenderState>) {
     let _gl_guard = state.gl_lock.lock().unwrap();
     unsafe {
         let gl = &*(state.gl_context as *const NSOpenGLContext);
+        let _cgl_guard = CglContextLock::acquire(gl);
         gl.makeCurrentContext();
+        (state.gl_finish)();
         (state.fns.free)(state.render_context as RenderContext);
         NSOpenGLContext::clearCurrentContext();
     }
+}
+
+fn suspend_rendering_for_surface_change(state: &Arc<RenderState>) {
+    let generation = state.surface_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    state.surface_changing.store(true, Ordering::Release);
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        // NSWindow Zoom/restore 是约 200–300ms 的多帧动画。每个 Resized 都会推进
+        // generation；只有最后一次尺寸变化安静 180ms 后才恢复提交视频帧。
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        if state.surface_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        state.surface_changing.store(false, Ordering::Release);
+        if state.visible.load(Ordering::Acquire) {
+            if let Ok(mut work) = state.work.lock() {
+                if !work.closing {
+                    work.force = true;
+                    work.pending = true;
+                    state.wake.notify_one();
+                }
+            }
+        }
+    });
 }
 
 fn render_frame(state: &RenderState, force: bool) {
     let render_ctx = state.render_context as RenderContext;
     // 隐藏切换竞态可能让已唤醒的线程到达这里；此时只消费一次 update。
     let flags = unsafe { (state.fns.update)(render_ctx) };
-    if !state.visible.load(Ordering::Acquire) {
+    if !state.visible.load(Ordering::Acquire)
+        || state.surface_changing.load(Ordering::Acquire)
+    {
         return;
     }
     let width = state.width.load(Ordering::Acquire);
@@ -176,6 +238,7 @@ fn render_frame(state: &RenderState, force: bool) {
     let _gl_guard = state.gl_lock.lock().unwrap();
     unsafe {
         let gl = &*(state.gl_context as *const NSOpenGLContext);
+        let _cgl_guard = CglContextLock::acquire(gl);
         gl.makeCurrentContext();
 
         let mut fbo = OpenGlFbo {
@@ -223,6 +286,11 @@ impl MacRenderer {
             libloading::Library::new("/System/Library/Frameworks/OpenGL.framework/OpenGL")
                 .map_err(|e| format!("加载 macOS OpenGL.framework 失败: {e}"))?
         });
+        let gl_finish = unsafe {
+            *gl_library
+                .get::<unsafe extern "C" fn()>(b"glFinish\0")
+                .map_err(|e| format!("OpenGL.framework 缺少 glFinish: {e}"))?
+        };
         let gl_library_id = &*gl_library as *const libloading::Library as usize;
         let webview_window = app.get_webview_window("main").ok_or("主窗口不存在")?;
         let window_id = webview_window.ns_window().map_err(|e| e.to_string())? as usize;
@@ -333,9 +401,12 @@ impl MacRenderer {
             render_context,
             view,
             gl_context,
+            gl_finish,
             width: AtomicI32::new(1),
             height: AtomicI32::new(1),
             visible: AtomicBool::new(true),
+            surface_changing: AtomicBool::new(false),
+            surface_generation: AtomicU64::new(0),
             gl_lock: Mutex::new(()),
             work: Mutex::new(RenderWork::default()),
             wake: Condvar::new(),
@@ -364,6 +435,7 @@ impl MacRenderer {
     /// 按 Wry 容器的真实 bounds 布局，避开标题栏尺寸被 Tauri inner_size 计入后
     /// 造成的纵向偏差。
     pub fn set_layout(&self, drawer_width: f64, top_height: f64, bottom_height: f64) {
+        suspend_rendering_for_surface_change(&self.state);
         let state = self.state.clone();
         let _ = self.app.run_on_main_thread(move || unsafe {
             let closing = state.work.lock().map(|work| work.closing).unwrap_or(true);
@@ -393,6 +465,12 @@ impl MacRenderer {
             };
 
             let _gl_guard = state.gl_lock.lock().unwrap();
+            let _cgl_guard = CglContextLock::acquire(gl);
+            gl.makeCurrentContext();
+            // flushBuffer 只提交异步命令；缩放 drawable 前等待 Metal/OpenGL 桥完成
+            // 对旧默认 framebuffer 的访问，否则驱动可能在动画中释放其 texture。
+            (state.gl_finish)();
+            NSOpenGLContext::clearCurrentContext();
             view.setFrame(NSRect::new(
                 NSPoint::new(0.0, y),
                 NSSize::new(
@@ -408,21 +486,19 @@ impl MacRenderer {
             state
                 .height
                 .store(backing.size.height.round() as i32, Ordering::Release);
+            drop(_cgl_guard);
             drop(_gl_guard);
-
-            // resize/1:1 在暂停时未必触发 mpv callback，强制渲染上一帧。
-            if let Ok(mut work) = state.work.lock() {
-                work.force = true;
-                work.pending = true;
-                state.wake.notify_one();
-            }
+            // 最后一轮 resize 安静 180ms 后由 debounce 任务强制重绘当前帧。
         });
     }
 
     /// 页面隐藏或窗口最小化时停止提交 OpenGL 帧；恢复时强制重绘上一帧。
     pub fn set_visible(&self, visible: bool) {
         let was_visible = self.state.visible.swap(visible, Ordering::AcqRel);
-        if visible && !was_visible {
+        if visible
+            && !was_visible
+            && !self.state.surface_changing.load(Ordering::Acquire)
+        {
             if let Ok(mut work) = self.state.work.lock() {
                 work.force = true;
                 work.pending = true;
@@ -433,6 +509,7 @@ impl MacRenderer {
 
     /// 实时切换 Retina surface 分辨率。必须在 AppKit 主线程更新 view/context。
     pub fn set_low_power_video(&self, low_power: bool) {
+        suspend_rendering_for_surface_change(&self.state);
         let state = self.state.clone();
         let _ = self.app.run_on_main_thread(move || unsafe {
             if state.work.lock().map(|work| work.closing).unwrap_or(true) {
@@ -442,6 +519,10 @@ impl MacRenderer {
             let view = &*(state.view as *const NSOpenGLView);
             let gl = &*(state.gl_context as *const NSOpenGLContext);
             let _gl_guard = state.gl_lock.lock().unwrap();
+            let _cgl_guard = CglContextLock::acquire(gl);
+            gl.makeCurrentContext();
+            (state.gl_finish)();
+            NSOpenGLContext::clearCurrentContext();
             view.setWantsBestResolutionOpenGLSurface(!low_power);
             gl.update(mtm);
             let backing = view.convertRectToBacking(view.bounds());
@@ -451,12 +532,9 @@ impl MacRenderer {
             state
                 .height
                 .store(backing.size.height.round() as i32, Ordering::Release);
+            drop(_cgl_guard);
             drop(_gl_guard);
-            if let Ok(mut work) = state.work.lock() {
-                work.force = true;
-                work.pending = true;
-                state.wake.notify_one();
-            }
+            // surface 稳定后由 debounce 任务重绘，避免切换 backing scale 的中间帧。
         });
     }
 

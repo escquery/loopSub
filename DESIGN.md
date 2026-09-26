@@ -31,6 +31,7 @@ loopSub ──spawn──> ffmpeg / ffprobe
 - 默认播放控制直接调用进程内 libmpv Client API；JSON IPC 只保留手动连接模式。
 - Windows 由 mpv 渲染到自建 HWND 子窗口。
 - macOS 创建透明 WKWebView + OpenGL 3.2 Core 双缓冲 `NSOpenGLView`；libmpv 更新回调只唤醒专用渲染线程，VideoToolbox 负责硬解。
+- macOS 的 AppKit drawable 更新与渲染线程通过 mutex + CGL context lock 双重串行；窗口缩放动画期间暂停提交，尺寸稳定后直接补画当前帧，避免 AppleMetalOpenGLRenderer 使用失效 framebuffer。
 - Windows/macOS 都以 `hwdec=auto-safe` 初始化，分别优先使用 D3D11VA / VideoToolbox。
 - 视频层避开 44px 顶栏、14px 进度条与右侧字幕面板，不参与鼠标和键盘输入。
 - 最小化、隐藏或被完全覆盖时停止提交视频帧；macOS 默认用逻辑分辨率 surface，由 WindowServer 缩放到 Retina，设置页可切回高分辨率。
