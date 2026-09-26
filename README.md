@@ -66,7 +66,7 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 | 平台 | 产物 | 外部程序 |
 |---|---|---|
 | Windows | `.msi` / `-setup.exe`（NSIS，免管理员） | **已内置 libmpv + ffmpeg，开箱即用** |
-| Windows 便携版 | `loopsub-portable.zip`（解压即用，`tools\pack_portable.ps1` 本地产出） | 同上，全部随包内置 |
+| Windows 便携版 | `loopsub-portable.zip`（按下文 PowerShell 命令本地产出） | 同上，全部随包内置 |
 | macOS Apple Silicon | `aarch64.dmg` | **已内置原生 libmpv + ffmpeg，开箱即用** |
 | macOS Intel | `x64.dmg` | **已内置原生 libmpv + ffmpeg，开箱即用** |
 
@@ -109,31 +109,245 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 
 所有操作通过 mpv `show-text` 在视频画面弹瞬态反馈（如 `A: 00:12.3`、`1.3x`）。
 
-## 从源码运行
+## 从源码运行与构建
 
-依赖：Rust ≥ 1.77、libmpv 与 ffmpeg、Tauri 系统依赖（Linux: `webkit2gtk-4.1` 等，见 [Tauri 文档](https://v2.tauri.app/start/prerequisites/)）。
+前端是纯静态 HTML/JS，**不需要 Node.js、npm 或 pnpm**。下面所有命令都从仓库根目录（能看到 `src/` 和 `src-tauri/` 的目录）执行。
 
-- **Windows**：从 [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake/releases) 下载 `mpv-dev` 包，将其中的 `libmpv-2.dll` 与 ffmpeg/ffprobe（gyan.dev 静态构建）放到 `src-tauri/target/debug/`（或运行后在设置页指定目录）
-- **Debian/Ubuntu**：`sudo apt install libmpv2 ffmpeg`
-- **macOS**：无需 Homebrew。脚本按当前架构下载预编译的 libmpv、ffmpeg、ffprobe（兼容 macOS 11+）到 `target/debug`
+三个动作不要混淆：
 
-```bash
-./scripts/setup_macos_deps.sh                    # macOS：只下载二进制，不本地编译依赖
-cargo run --manifest-path src-tauri/Cargo.toml   # 开发运行（无 node 步骤）
-cd src-tauri && cargo test --lib                 # 单元测试
+| 目的 | Cargo 命令 | 原生依赖放置位置 |
+|---|---|---|
+| 开发运行 | `cargo run --manifest-path src-tauri/Cargo.toml` | `src-tauri/target/debug/` |
+| 只生成 Release 可执行文件 | `cargo build --release --manifest-path src-tauri/Cargo.toml` | `src-tauri/target/release/` |
+| 生成安装包 | `cargo tauri build` | `src-tauri/resources/`，由 Tauri 收进安装包 |
+
+> `cargo clean` 会删除 `src-tauri/target/`，也会删除已放进去的开发/Release 依赖。清理后请重新运行对应的依赖脚本。
+
+### Windows 10/11 x64
+
+#### 1. 安装编译环境
+
+需要以下组件：
+
+- [Rustup](https://rustup.rs/) 与 MSVC Rust 工具链（Rust ≥ 1.77.2）
+- Visual Studio 2022 Build Tools 的 **Desktop development with C++** 工作负载及 Windows 10/11 SDK
+- Microsoft Edge WebView2 Runtime（Windows 11 通常已内置）
+- 7-Zip（依赖脚本用它解压 `mpv-dev`）
+- Git
+
+可在管理员或普通 PowerShell 中安装常用组件；Visual Studio 工作负载也可在 Visual Studio Installer 中勾选：
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Rustlang.Rustup -e
+winget install --id 7zip.7zip -e
+winget install --id Microsoft.EdgeWebView2Runtime -e
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 ```
 
-macOS 本地 Release 可执行文件先运行 `./scripts/setup_macos_deps.sh release`；打包可分发的 `.app/.dmg` 则先运行 `./scripts/setup_macos_deps.sh bundle`。
+安装完成后重新打开 PowerShell，并确认工具链：
 
-## 打包
-
-CI 自动出包（`.github/workflows/release.yml`，三平台矩阵：Windows / macOS Intel `macos-15-intel` / macOS ARM）：
-
-```bash
-git tag v0.1.0 && git push origin v0.1.0   # 或在 Actions 页手动触发
+```powershell
+rustup default stable-x86_64-pc-windows-msvc
+rustup target add x86_64-pc-windows-msvc
+rustc -V
+cargo -V
 ```
 
-CI 构建前按目标架构下载 libmpv（Windows：shinchiro mpv-dev；macOS：media-kit LGPL video-default）与 ffmpeg（Windows：gyan.dev；macOS：Martin Riedl 静态构建）注入安装包，产物汇总为草稿 Release。本地打包需 `cargo install tauri-cli` 后 `cargo tauri build`。
+#### 2. 获取源码和开发依赖
+
+```powershell
+git clone https://github.com/escquery/loopSub.git
+cd loopSub
+
+# 下载 x86_64 libmpv、ffmpeg、ffprobe 到 src-tauri\target\debug\
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_windows_deps.ps1 dev
+```
+
+脚本从 [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake/releases) 获取最新 `mpv-dev`，从 gyan.dev 获取 ffmpeg/ffprobe，并缓存在 `src-tauri\target\windows-deps\`。需要重新下载最新版时加 `-ForceRefresh`。
+
+#### 3. 开发运行和测试
+
+```powershell
+# 启动空播放器
+cargo run --manifest-path .\src-tauri\Cargo.toml
+
+# 启动并直接打开视频；-- 后面是传给 loopSub 的参数
+cargo run --manifest-path .\src-tauri\Cargo.toml -- "D:\Videos\S01E01.mkv"
+
+# 编译检查和全部 Rust 测试
+cargo check --all-targets --manifest-path .\src-tauri\Cargo.toml
+cargo test --manifest-path .\src-tauri\Cargo.toml
+```
+
+开发运行至少应存在：
+
+```text
+src-tauri\target\debug\libmpv-2.dll
+src-tauri\target\debug\ffmpeg.exe
+src-tauri\target\debug\ffprobe.exe
+```
+
+#### 4. 编译 Release 可执行文件
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_windows_deps.ps1 release
+cargo build --release --manifest-path .\src-tauri\Cargo.toml
+
+.\src-tauri\target\release\loopsub.exe "D:\Videos\S01E01.mkv"
+```
+
+裸 Release 可执行文件依赖同目录的 `libmpv-2.dll`、`ffmpeg.exe` 和 `ffprobe.exe`。制作便携包可直接压缩这四个文件：
+
+```powershell
+$portable = ".\dist\loopsub-portable"
+New-Item -ItemType Directory -Force $portable | Out-Null
+$files = @(
+  ".\src-tauri\target\release\loopsub.exe"
+  ".\src-tauri\target\release\libmpv-2.dll"
+  ".\src-tauri\target\release\ffmpeg.exe"
+  ".\src-tauri\target\release\ffprobe.exe"
+)
+Copy-Item -Path $files -Destination $portable -Force
+Compress-Archive -Path "$portable\*" -DestinationPath .\dist\loopsub-portable.zip -Force
+```
+
+#### 5. 生成 Windows 安装包
+
+```powershell
+cargo install tauri-cli --version "^2" --locked
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_windows_deps.ps1 bundle
+cargo tauri build --target x86_64-pc-windows-msvc
+```
+
+产物位于：
+
+```text
+src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\*.msi
+src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\*-setup.exe
+```
+
+如果省略 `--target x86_64-pc-windows-msvc`，产物通常在 `src-tauri\target\release\bundle\` 下。
+
+### macOS（Apple Silicon / Intel）
+
+#### 1. 安装编译环境
+
+支持 macOS 11+；当前开发与实测覆盖 Apple Silicon。只需要 Xcode Command Line Tools 和 Rust，不需要 Homebrew 或 Node.js：
+
+```bash
+xcode-select --install
+
+# 尚未安装 Rust 时执行；完成后重新打开终端或 source "$HOME/.cargo/env"
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustup default stable
+
+uname -m
+rustc -V
+cargo -V
+rustc -vV | grep '^host:'
+```
+
+`uname -m` 应为 `arm64` 或 `x86_64`；依赖脚本会下载相同架构的预编译文件。
+
+#### 2. 获取源码和开发依赖
+
+```bash
+git clone https://github.com/escquery/loopSub.git
+cd loopSub
+
+# 下载原生 libmpv、ffmpeg、ffprobe 到 src-tauri/target/debug/
+./scripts/setup_macos_deps.sh dev
+```
+
+脚本只下载预编译二进制，不会调用 Homebrew 或本地编译 mpv/FFmpeg。下载内容缓存在 `src-tauri/target/macos-deps/`。
+
+#### 3. 开发运行和测试
+
+```bash
+# 启动空播放器
+cargo run --manifest-path src-tauri/Cargo.toml
+
+# 启动并直接打开视频
+cargo run --manifest-path src-tauri/Cargo.toml -- "/Users/me/Movies/S01E01.mkv"
+
+# 编译检查和全部 Rust 测试
+cargo check --all-targets --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+开发运行至少应存在：
+
+```text
+src-tauri/target/debug/libmpv.dylib
+src-tauri/target/debug/ffmpeg
+src-tauri/target/debug/ffprobe
+```
+
+可用下面的命令确认三者架构与当前机器一致：
+
+```bash
+file src-tauri/target/debug/libmpv.dylib \
+     src-tauri/target/debug/ffmpeg \
+     src-tauri/target/debug/ffprobe
+```
+
+#### 4. 编译 Release 可执行文件
+
+```bash
+./scripts/setup_macos_deps.sh release
+cargo build --release --manifest-path src-tauri/Cargo.toml
+
+./src-tauri/target/release/loopsub "/Users/me/Movies/S01E01.mkv"
+```
+
+#### 5. 生成 `.app` 和 `.dmg`
+
+```bash
+cargo install tauri-cli --version "^2" --locked
+./scripts/setup_macos_deps.sh bundle
+cargo tauri build
+```
+
+Tauri 会自动合并 `src-tauri/tauri.conf.json` 与 `src-tauri/tauri.macos.conf.json`。当前架构的产物位于：
+
+```text
+src-tauri/target/release/bundle/macos/loopSub.app
+src-tauri/target/release/bundle/dmg/*.dmg
+```
+
+本地包默认没有 Developer ID 签名和 Apple 公证，只适合本机测试。正式分发还需配置 Developer ID Application 证书、签名、公证和 staple。
+
+### 依赖脚本模式速查
+
+| 系统 | 开发运行 | Release 可执行文件 | 安装包资源 |
+|---|---|---|---|
+| Windows PowerShell | `.\scripts\setup_windows_deps.ps1 dev` | `.\scripts\setup_windows_deps.ps1 release` | `.\scripts\setup_windows_deps.ps1 bundle` |
+| macOS | `./scripts/setup_macos_deps.sh dev` | `./scripts/setup_macos_deps.sh release` | `./scripts/setup_macos_deps.sh bundle` |
+
+如果程序提示找不到 libmpv/ffmpeg，先确认执行过与当前 Cargo 模式对应的脚本，而不是只把依赖放进另一个目录。也可以在设置页“外部程序”中指定依赖目录。
+
+### 常见构建问题
+
+- Windows 报 `link.exe`、`kernel32.lib` 或 `assert.h` 缺失：在 Visual Studio Installer 修复 **Desktop development with C++** 和 Windows SDK，并从新的 PowerShell 重试。
+- Windows 提示脚本执行被禁用：使用上文的 `powershell -ExecutionPolicy Bypass -File ...` 调用方式。
+- Windows 下载依赖触发 GitHub API 限流：稍后重试，或保留 `src-tauri\target\windows-deps\` 缓存，不要反复使用 `-ForceRefresh`。
+- macOS 报架构不匹配：删除错误目录后重新运行脚本；交叉准备时可显式设置 `LOOPSUB_MAC_ARCH=arm64` 或 `LOOPSUB_MAC_ARCH=x86_64`。
+- `error: no such command: tauri`：执行 `cargo install tauri-cli --version "^2" --locked`，并确认 `$HOME/.cargo/bin`（Windows 为 `%USERPROFILE%\.cargo\bin`）在 PATH 中。
+- 国内网络无法访问 crates.io 时，可配置可用的 Cargo sparse 镜像后重试；不要把个人镜像配置提交到仓库。
+
+## CI 打包发布
+
+`.github/workflows/release.yml` 使用 Windows MSVC、macOS Intel `macos-15-intel` 和 macOS ARM 三平台矩阵。CI 会按目标架构下载 libmpv、ffmpeg、ffprobe，执行 `cargo tauri build`，并把安装包汇总到草稿 Release。
+
+```bash
+# 确认版本号和当前提交后再创建正式 tag
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+也可以在 GitHub Actions 页面手动运行 Release workflow 并填写 tag。Windows 依赖来自 shinchiro/gyan.dev；macOS 依赖来自 media-kit/Martin Riedl。
 
 ## 项目结构
 
@@ -144,7 +358,7 @@ CI 构建前按目标架构下载 libmpv（Windows：shinchiro mpv-dev；macOS�
 │   └── settings.js          # 设置页（11 分区 + 30 键位改绑）
 ├── src-tauri/src/
 │   ├── lib.rs               # Tauri 命令装配与应用状态
-│   ├── mpv/                 # libmpv dlopen C API（embed）+ 自建视频窗口（vidwin）+ IPC（手动连接外部 mpv）
+│   ├── mpv/                 # libmpv Client/Render API、macOS OpenGL 层、Windows HWND、手动 IPC
 │   ├── media/               # ffprobe/ffmpeg 字幕探测与导出
 │   ├── subtitle/            # SRT 解析、句子表、大写还原
 │   ├── opensub/             # OpenSubtitles（moviehash + 搜索 + 下载）
@@ -154,16 +368,15 @@ CI 构建前按目标架构下载 libmpv（Windows：shinchiro mpv-dev；macOS�
 │   ├── bins.rs              # 外部二进制解析 + CREATE_NO_WINDOW
 │   ├── sync.rs              # 字幕-音频自动对齐（能量包络互相关）
 │   ├── anki.rs              # Anki 制卡（截图 + 音频切片 + AnkiConnect）
-│   ├── explorer_menu.rs     # 资源管理器右键菜单（HKCU 按扩展名注册）
-│   └── winctl.rs            # Windows mpv 窗口召回（SetWindowPos）
+│   └── explorer_menu.rs     # 资源管理器右键菜单（HKCU 按扩展名注册）
+├── scripts/                 # Windows/macOS 预编译原生依赖安装脚本
 ├── .github/workflows/       # CI 自动打包
-├── tools/                   # 本地工具（便携版打包 / 副屏调试，gitignored）
 └── DESIGN.md                # 完整设计文档（焦点模型/翻译策略/里程碑）
 ```
 
 ## 文档与路线
 
-详细设计决策（焦点模型、翻译管线策略、字幕同步问题分析）见 [DESIGN.md](DESIGN.md)。已完成 v1（播放闭环）、v1.5（搜索 + 翻译）与 v2（libmpv 进程内嵌入单窗口、字幕自动对齐、Anki 导出、资源管理器集成）；后续规划：翻译并发与断点续翻。
+详细设计决策（焦点模型、翻译管线策略、字幕同步问题分析）见 [DESIGN.md](DESIGN.md)。已完成 v1（播放闭环）、v1.5（搜索 + 翻译）与 v2（libmpv 进程内嵌入单窗口、翻译重试与断点续翻、字幕自动对齐、Anki 导出、资源管理器集成）；后续重点是 Windows 真机功耗验收、安装包验证以及 macOS 签名公证。
 
 ## License
 

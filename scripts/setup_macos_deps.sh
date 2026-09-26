@@ -83,7 +83,8 @@ if [[ ! -f "$CACHE/.complete" ]]; then
 fi
 
 mkdir -p "$DEST"
-rm -f "$DEST"/*.dylib "$DEST/ffmpeg" "$DEST/ffprobe"
+# 同一工作区曾在 Windows 打包时，避免把残留的 PE 依赖一起收入 macOS 包。
+rm -f "$DEST"/*.dylib "$DEST"/*.dll "$DEST"/*.exe "$DEST/ffmpeg" "$DEST/ffprobe"
 cp "$CACHE"/*.dylib "$CACHE/ffmpeg" "$CACHE/ffprobe" "$DEST/"
 chmod +x "$DEST/ffmpeg" "$DEST/ffprobe"
 
