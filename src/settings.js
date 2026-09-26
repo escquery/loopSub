@@ -136,7 +136,7 @@ const SettingsUI = {
       </section>
       <section>
         <h3>音频</h3>
-        <label class="row"><input type="checkbox" data-k="audio.dialogue_boost" ${s.audio.dialogue_boost ? 'checked' : ''} /> 对白增强（语音频段优化）</label>
+        <label class="row"><input type="checkbox" data-k="audio.dialogue_boost" ${s.audio.dialogue_boost ? 'checked' : ''} /> ${IS_MAC ? '对白增强（Dolby 动态压缩 + 人声清晰度）' : '对白增强（动态压缩 + 峰值保护）'}</label>
         <label>音量上限 %（0 = 不限制）<input type="number" data-k="audio.volume_max" value="${s.audio.volume_max ?? 0}" /></label>
       </section>
       <section>
@@ -258,9 +258,13 @@ document.addEventListener(
 
 $s('#btn-settings-save').addEventListener('click', async () => {
   try {
+    const dialogueBoostBefore = Boolean(SettingsUI.settings.audio.dialogue_boost);
     const s = SettingsUI.collect();
+    const dialogueBoostChanged = dialogueBoostBefore !== Boolean(s.audio.dialogue_boost);
     await tauriInvoke('save_settings', { settings: s });
-    $s('#settings-msg').textContent = '已保存';
+    $s('#settings-msg').textContent = dialogueBoostChanged
+      ? `已保存；对白增强已${s.audio.dialogue_boost ? '开启' : '关闭'}（立即生效）`
+      : '已保存';
     // 通知主界面热加载
     window.dispatchEvent(new CustomEvent('settings-saved', { detail: s }));
     setTimeout(() => ($s('#settings-msg').textContent = ''), 2000);

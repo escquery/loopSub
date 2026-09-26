@@ -64,7 +64,7 @@ loopSub ──spawn──> ffmpeg / ffprobe
 | 译文显隐 | `secondary-sid` 切换（mpv 渲染模式下） |
 | 字幕延迟微调 | `sub-delay` / `secondary-sub-delay`（双轨默认联动） |
 | 瞬态反馈 | `show-text "..." 1000` 显示在视频画面上 |
-| 对白增强 | Windows：短时压缩 + limiter；macOS 轻量包：语音频段 equalizer |
+| 对白增强 | 保存后实时增删 `af`；Windows：短时压缩 + limiter；macOS：AC-3/E-AC-3 标准 DRC + 三段语音 equalizer，切换 DRC 时重载当前 Dolby 音轨 |
 | 状态同步 | 订阅 `pause` / `time-pos` / `duration` / `eof-reached` / `sub-start` / `sub-end` |
 
 **当前句判定不依赖 mpv**：订阅 `time-pos` 在程序自己的句子表里反查
@@ -184,7 +184,7 @@ OpenSubtitles Key 在首次搜索时校验；LLM 配置在首次翻译时校验�
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| 对白增强 | 开 | Windows 固定参数压缩；macOS 使用轻量包内置 equalizer，均不跨 AB 学习历史响度 |
+| 对白增强 | 开 | Windows 固定参数压缩；macOS 使用 Dolby 解码器 DRC + 轻量包内置 equalizer；保存后实时生效，均不跨 AB 学习历史响度 |
 | 音量上限 | 关闭 | 可选 150%/200%（`volume-max`） |
 | 中置声道提升 | 关（进阶） | 5.1 片源 `pan` 滤镜加权 FC 进立体声 |
 

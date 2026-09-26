@@ -30,7 +30,7 @@ loopSub ──spawn──> ffmpeg/ffprobe  （字幕探测与导出）
 - AB 区间循环、单句循环、A/B 点 100ms 级微调
 - 跟读模式（句末自动暂停）、0.25–3.0x 变速
 - 字幕延迟微调（±0.1s / ±0.5s，按视频 hash 记忆）
-- 对白增强（Windows 使用短时压缩，macOS 使用轻量 libmpv 支持的语音频段均衡）
+- 对白增强（保存后立即生效；Windows 使用短时压缩与峰值保护，macOS 使用 Dolby DRC + 三段语音清晰度均衡）
 
 **字幕获取管线**
 - 内嵌字幕：`ffprobe` 探测 → `ffmpeg` 导出文本轨（图形轨 PGS/VobSub 自动识别并提示）

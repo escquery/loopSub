@@ -41,18 +41,58 @@ const PROGRESS_H: f64 = 14.0;
 #[cfg(any(windows, target_os = "macos"))]
 const DRAWER_W: f64 = 420.0;
 
-/// 对白增强使用短时固定参数压缩器，而不是 dynaudnorm。后者默认会在十几秒
-/// 窗口内持续学习响度，AB 回跳不会重置这段历史，因此同一句每轮增益都可能不同。
-/// acompressor 只保留 180ms 的释放状态：压低峰值后固定补偿约 +9.5dB；limiter
-/// 仅负责兜住瞬态峰值，避免削波。参数不随已播放内容学习，循环响度可重复。
-// media-kit 的 macOS video-default 构建为减小体积只带 FFmpeg equalizer，
-// 不带 acompressor/alimiter；给它下发压缩链会在开始解码后让整条音轨初始化失败。
-// macOS 改用同样可提升对白清晰度、且该构建明确启用的语音频段均衡链。
+/// Windows 对白增强使用短时固定参数压缩器，而不是 dynaudnorm。后者默认会在
+/// 十几秒窗口内持续学习响度，AB 回跳不会重置这段历史，因此同一句每轮增益可能
+/// 不同。acompressor 只保留 180ms 的释放状态；limiter 负责兜住瞬态峰值。
+///
+/// media-kit 的 macOS video-default 构建为减小体积只带 FFmpeg equalizer，不带
+/// acompressor/alimiter。macOS 因此组合两部分：对 AC-3/E-AC-3 启用解码器自带的
+/// 标准 DRC，并用三段 EQ 削弱低频、提升 1.5–3kHz 的语音清晰度。该组合不引入
+/// GPL 编码器，也不会让当前 LGPL libmpv 因缺失滤镜而初始化音轨失败。
 #[cfg(target_os = "macos")]
-const DIALOGUE_BOOST_AF: &str =
-    "lavfi=[equalizer=f=180:t=q:w=0.8:g=-3,equalizer=f=2500:t=q:w=1.2:g=4]";
+const DIALOGUE_BOOST_AF: &str = "lavfi=[equalizer=f=180:t=q:w=0.8:g=-2,equalizer=f=1500:t=q:w=1:g=3,equalizer=f=3000:t=q:w=1:g=4]";
 #[cfg(not(target_os = "macos"))]
 const DIALOGUE_BOOST_AF: &str = "lavfi=[acompressor=threshold=0.125:ratio=3:attack=15:release=180:makeup=3:knee=2.828:detection=rms,alimiter=limit=0.95:attack=5:release=50:level=false]";
+
+const MPV_DEFAULT_VOLUME_MAX: u32 = 130;
+
+fn dialogue_boost_filter(enabled: bool) -> &'static str {
+    if enabled {
+        DIALOGUE_BOOST_AF
+    } else {
+        ""
+    }
+}
+
+/// mpv 默认关闭 AC-3 元数据 DRC。Windows 已有通用压缩链，不重复压缩；macOS
+/// 当前 libavfilter 没有压缩器，只在开启对白增强时使用解码器的标准 DRC。
+fn dialogue_ac3_drc(enabled: bool) -> f64 {
+    if cfg!(target_os = "macos") && enabled {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod audio_setting_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_dialogue_boost_clears_filter_and_drc() {
+        assert_eq!(dialogue_boost_filter(false), "");
+        assert_eq!(dialogue_ac3_drc(false), 0.0);
+    }
+
+    #[test]
+    fn enabled_dialogue_boost_uses_platform_audio_chain() {
+        assert_eq!(dialogue_boost_filter(true), DIALOGUE_BOOST_AF);
+        #[cfg(target_os = "macos")]
+        assert_eq!(dialogue_ac3_drc(true), 1.0);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(dialogue_ac3_drc(true), 0.0);
+    }
+}
 
 /// 重排原生视频层到顶栏以下、字幕抽屉以左、进度条以上的区域。
 #[cfg(any(windows, target_os = "macos"))]
@@ -423,6 +463,71 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
     state.settings.lock().unwrap().clone()
 }
 
+/// 把设置页的音频选项同步到已存在的 mpv。切换 macOS 对白增强时，若当前是
+/// AC-3/E-AC-3，短暂重选一次音轨，使只在解码器创建时读取的 drc_scale 立即生效。
+async fn apply_audio_settings(
+    mpv: &Mpv,
+    audio: &settings::AudioSettings,
+    reload_dolby_decoder: bool,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let drc = dialogue_ac3_drc(audio.dialogue_boost);
+    let drc_applied = match mpv.set_property("ad-lavc-ac3drc", drc.into()).await {
+        Ok(()) => true,
+        Err(e) => {
+            errors.push(format!("AC-3 DRC: {e}"));
+            false
+        }
+    };
+
+    if drc_applied && reload_dolby_decoder && cfg!(target_os = "macos") {
+        let codec = mpv
+            .get_property("audio-codec-name")
+            .await
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned));
+        if matches!(codec.as_deref(), Some("ac3" | "eac3")) {
+            if let Ok(aid) = mpv.get_property("aid").await {
+                let active = !matches!(&aid, serde_json::Value::String(value) if value == "no");
+                if active {
+                    match mpv.set_property("aid", "no".into()).await {
+                        Ok(()) => {
+                            if let Err(e) = mpv.set_property("aid", aid).await {
+                                // 原轨恢复失败时至少尝试让 mpv 自动选择一条音轨。
+                                let _ = mpv.set_property("aid", "auto".into()).await;
+                                errors.push(format!("重新载入 Dolby 音轨: {e}"));
+                            }
+                        }
+                        Err(e) => errors.push(format!("暂停 Dolby 音轨: {e}")),
+                    }
+                }
+            }
+        }
+    }
+
+    if let Err(e) = mpv
+        .set_property("af", dialogue_boost_filter(audio.dialogue_boost).into())
+        .await
+    {
+        errors.push(format!("对白滤镜: {e}"));
+    }
+    if let Err(e) = mpv
+        .set_property(
+            "volume-max",
+            audio.volume_max.unwrap_or(MPV_DEFAULT_VOLUME_MAX).into(),
+        )
+        .await
+    {
+        errors.push(format!("音量上限: {e}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
 #[tauri::command]
 async fn save_settings(
     state: tauri::State<'_, AppState>,
@@ -432,14 +537,34 @@ async fn save_settings(
         .save(&state.settings_path)
         .map_err(|e| e.to_string())?;
     let hotkeys = settings.hotkeys.clone();
+    let audio = settings.audio.clone();
+    let dialogue_boost_changed =
+        state.settings.lock().unwrap().audio.dialogue_boost != audio.dialogue_boost;
     let subtitle_visible = matches!(settings.subtitle.render, settings::RenderMode::Mpv);
     let low_power_video = settings.window.macos_low_power_video;
     *state.settings.lock().unwrap() = settings;
-    // 快捷键和视频画面字幕均实时生效；失败不影响已成功落盘的设置，下一次
-    // 创建 mpv 实例时仍会按设置重新同步。
+    // 快捷键、音频、视频画面字幕和渲染模式均实时生效；失败不影响已成功落盘的
+    // 设置，下一次创建 mpv 实例时仍会按设置重新同步。
     if let Some(mpv) = state.mpv.lock().await.as_ref() {
         if let Err(e) = mpv.bind_hotkeys(&hotkeys).await {
             eprintln!("[hotkeys] rebind failed: {e}");
+        }
+        let audio_applied = match apply_audio_settings(mpv, &audio, dialogue_boost_changed).await {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("[audio] live settings update failed: {e}");
+                false
+            }
+        };
+        if dialogue_boost_changed && audio_applied {
+            let status = if audio.dialogue_boost {
+                "对白增强：已开启"
+            } else {
+                "对白增强：已关闭"
+            };
+            let _ = mpv
+                .command(vec!["show-text".into(), status.into(), 1500.into()])
+                .await;
         }
         if let Err(e) = mpv
             .set_property("sub-visibility", subtitle_visible.into())
@@ -537,14 +662,9 @@ async fn mpv_start_internal(state: &AppState, app: &tauri::AppHandle) -> Result<
     }
 
     let audio = state.audio();
-    if audio.dialogue_boost {
-        m.set_property("af", DIALOGUE_BOOST_AF.into())
-            .await
-            .map_err(|e| format!("启用对白增强失败: {e}"))?;
-    }
-    if let Some(vm) = audio.volume_max {
-        let _ = m.set_property("volume-max", vm.into()).await;
-    }
+    apply_audio_settings(&m, &audio, false)
+        .await
+        .map_err(|e| format!("应用音频设置失败: {e}"))?;
 
     *guard = Some(m);
     // 实例进入 AppState 后再投递原生视频层布局；闭包执行时本函数已释放 mpv 锁。

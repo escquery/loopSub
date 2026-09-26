@@ -26,7 +26,8 @@ pub struct Settings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioSettings {
-    /// 对白增强（固定参数短时压缩 + 峰值限制），默认开启
+    /// 对白增强：Windows 为固定参数短时压缩 + 峰值限制；macOS 为 Dolby
+    /// 解码器 DRC + 语音清晰度均衡。默认开启，保存设置后实时同步到 mpv。
     pub dialogue_boost: bool,
     /// 音量上限百分比；None 表示不生效（mpv 默认 130）
     pub volume_max: Option<u32>,
